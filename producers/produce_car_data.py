@@ -3,13 +3,17 @@ import time
 import random
 import threading
 from kafka import KafkaProducer, KafkaConsumer
+import sys, os
+# producers/ -> go up one level to project root
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ev_logger import log, log_error
 
 # Configuration
-NUM_CARS = 5
-UPDATE_INTERVAL = 2.5
+NUM_CARS = 1
+UPDATE_INTERVAL = 1.25
 TOPIC_REAL = "cars_real"
 TOPIC_COMMANDS = "charging_commands"
-BOOTSTRAP_SERVERS = 'localhost:9092'
+BOOTSTRAP_SERVERS = os.environ.get('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092')
 BATTERY_CAPACITY_KWH = 60.0
 
 class Car:
@@ -19,21 +23,18 @@ class Car:
         self.battery_level = start_battery
         self.priority = priority
         self.k = k
-        self.is_charging = False 
-        self.is_parked = False # Controlled entirely by Flink
-    
-    def update(self):
-        # Simulate discharging (driving) only if Flink hasn't parked/charged us
-        if not self.is_parked:
-            self.battery_level = max(0.0, self.battery_level - self.k)
+        self.is_charging = False
+        self.is_parked = True   # Cars start at station so Flink can see them immediately
 
-    def set_battery(self, new_soc, is_charging):
-        if new_soc is not None:
-            self.battery_level = new_soc * 100.0 
-            
-        self.is_charging = is_charging
-        self.is_parked = is_charging # Parked if charging, driving if not
-            
+    def update(self):
+        if self.is_charging:
+            # Flink controls charging — battery updated via START_CHARGING commands
+            log('CAR_UPDATE', f"{self.id} | CHARGING | batt={self.battery_level:.1f}%")
+        elif not self.is_parked:
+            # Driving — discharge continuously, Flink decides when to call back for charging
+            self.battery_level = max(0.0, self.battery_level - self.k)
+            log('CAR_UPDATE', f"{self.id} | DRIVING | batt={self.battery_level:.1f}%")
+
     def to_dict(self):
         return {
             "id": self.id,
@@ -41,12 +42,13 @@ class Car:
             "current_battery_kwh": (self.battery_level / 100.0) * BATTERY_CAPACITY_KWH,
             "current_soc": self.battery_level / 100.0,
             "priority": self.priority,
-            "plugged_in": self.is_parked, # Important for Flink
+            "plugged_in": self.is_parked,  # Important for Flink
             "timestamp": time.time()
         }
 
 # Global dictionary to access cars from consumer thread
 cars_map = {}
+cars_lock = threading.Lock()  # Protects cars_map and Car field writes across threads
 
 def consume_commands():
     """Background thread to listen for charging commands/updates from Flink."""
@@ -56,30 +58,39 @@ def consume_commands():
         group_id='car_producer_feedback',
         value_deserializer=lambda x: json.loads(x.decode('utf-8'))
     )
-    
+
     print("Command Consumer Started...")
     for message in consumer:
         cmd = message.value
-        car_id = cmd.get('car_id')
-        action = cmd.get('action')
+        car_id  = cmd.get('car_id')
+        action  = cmd.get('action')
         new_soc = cmd.get('new_soc')
-        
-        if car_id in cars_map:
-            car = cars_map[car_id]
-            if action == 'START_CHARGING':
-                # If it wasn't already charging, announce it plugged in
-                if not car.is_parked:
-                    print(f"[FLINK COMMAND] {car_id} -> 🔌 PLUGGED IN. Starting charge at {car.battery_level:.1f}%")
-                car.set_battery(new_soc, True)
-            elif action == 'STOP_CHARGING':
-                # Only print if the car was previously charging/parked
-                if car.is_parked:
-                    print(f"[FLINK COMMAND] {car_id} -> 🛑 STOP CHARGING. Disconnected at {new_soc*100 if new_soc else car.battery_level:.1f}%")
-                car.set_battery(new_soc, False)
+
+        with cars_lock:
+            if car_id in cars_map:
+                car = cars_map[car_id]
+                if action == 'START_CHARGING':
+                    log('CAR_PROD', f"{car_id} | START_CHARGING | new_soc={new_soc} | batt_before={car.battery_level:.1f}%")
+                    # Accept Flink's SOC only if it's higher — Flink accumulates energy
+                    # correctly when it owns the state (flink_managed=True), so its value
+                    # should be trusted and never lowered by a stale sensor reading.
+                    if new_soc is not None and (new_soc * 100.0) > car.battery_level:
+                        car.battery_level = new_soc * 100.0
+                    car.is_charging = True
+                    car.is_parked   = True
+                    log('CAR_PROD', f"{car_id} | after START | batt={car.battery_level:.1f}%")
+                elif action == 'STOP_CHARGING':
+                    log('CAR_PROD', f"{car_id} | STOP_CHARGING | new_soc={new_soc} | batt_before={car.battery_level:.1f}%")
+                    # Never let STOP lower the battery — Flink's new_soc can be stale
+                    if new_soc is not None and (new_soc * 100.0) > car.battery_level:
+                        car.battery_level = new_soc * 100.0
+                    car.is_charging = False
+                    car.is_parked = False  # Car leaves station and drives — Flink will call it back when needed
+                    log('CAR_PROD', f"{car_id} | after STOP | batt={car.battery_level:.1f}% | driving")
 
 def main():
-    print(f"Starting Car Producer with Flink-Only Logic...")
-    
+    print(f"Starting Car Producer with Delegation Logic...")
+
     producer = KafkaProducer(
         bootstrap_servers=BOOTSTRAP_SERVERS,
         value_serializer=lambda v: json.dumps(v).encode('utf-8')
@@ -87,28 +98,29 @@ def main():
 
     # Initialize cars
     for i in range(1, NUM_CARS + 1):
-        # Force all cars to start with >80% battery
         start_battery = random.uniform(85.0, 100.0)
         priority = random.randint(1, 5)
-        # Average battery life ~360s. Interval 2.5s. K ~ 0.7%
-        discharge_k = random.uniform(0.4, 1.0)
+        discharge_k = random.uniform(0.4, 1.0)  # % per tick (2.5s)
 
-        # Create Real Car
         car = Car(f"car_{i}", "real", start_battery, priority, discharge_k)
         cars_map[f"car_{i}"] = car
 
     print(f"Initialized {NUM_CARS} cars.")
-    
+
     # Start Consumer Thread
     t = threading.Thread(target=consume_commands, daemon=True)
     t.start()
 
     try:
         while True:
-            # Update and Send Real Group
-            for car_id, car in cars_map.items():
-                car.update()
-                producer.send(TOPIC_REAL, car.to_dict())
+            # Snapshot cars under lock, then update and send outside lock
+            with cars_lock:
+                items = list(cars_map.items())
+            for car_id, car in items:
+                with cars_lock:
+                    car.update()
+                    data = car.to_dict()
+                producer.send(TOPIC_REAL, data)
 
             producer.flush()
             time.sleep(UPDATE_INTERVAL)

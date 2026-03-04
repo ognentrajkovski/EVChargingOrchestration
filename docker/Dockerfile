@@ -7,7 +7,7 @@ RUN apt-get update -y && apt-get install -y python3 python3-pip python3-dev buil
 RUN pip3 install --upgrade pip
 
 # Install dependencies
-RUN JAVA_HOME=/usr/lib/jvm/default-java pip3 install kafka-python-ng numpy pulp pandas apache-flink==1.17.0
+RUN JAVA_HOME=/usr/lib/jvm/default-java pip3 install kafka-python-ng numpy pulp pandas streamlit apache-flink==1.17.0
 
 # Download Kafka Connector JAR
 RUN wget -P /opt/flink/lib https://repo1.maven.org/maven2/org/apache/flink/flink-sql-connector-kafka/1.17.0/flink-sql-connector-kafka-1.17.0.jar

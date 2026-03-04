@@ -3,7 +3,6 @@
 # Kill any existing python producers
 pkill -f produce_energy_data.py
 pkill -f produce_car_data.py
-pkill -f produce_station_events.py
 
 echo "Starting all producers..."
 

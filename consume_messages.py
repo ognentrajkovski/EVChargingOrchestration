@@ -13,8 +13,7 @@ consumer = KafkaConsumer(
     enable_auto_commit=False
 )
 
-print(f"Listening to topics: {topics} on {bootstrap_servers}...
-")
+print(f"Listening to topics: {topics} on {bootstrap_servers}...")
 
 try:
     for message in consumer:
@@ -29,7 +28,6 @@ try:
             print(f"[{topic}] {value}")
 
 except KeyboardInterrupt:
-    print("
-Stopping consumer...")
+    print("Stopping consumer...")
 finally:
     consumer.close()
