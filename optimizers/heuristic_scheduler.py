@@ -18,7 +18,7 @@ MIN_DURATION_BLOCKS = 1
 MAX_SESSIONS_PER_DAY = 3
 
 
-def smart_heuristic_schedule(prices, cars, current_idx=0):
+def smart_heuristic_schedule(prices, cars, current_idx=0, sessions_used=None, station_capacity=None):
     # Input validation
     if not prices:
         return {c['id']: [] for c in cars if c.get('id')}
@@ -39,9 +39,11 @@ def smart_heuristic_schedule(prices, cars, current_idx=0):
     cars.sort(key=lambda x: (x['priority'], -x['current_soc']), reverse=True)
 
     # 3. Initialize Schedule & Tracking
+    _capacity = station_capacity if station_capacity and station_capacity > 0 else STATION_CAPACITY
     schedule = {c['id']: [] for c in cars}
     station_load = [0] * total_intervals
-    car_sessions = {c['id']: 0 for c in cars}
+    _used = sessions_used or {}
+    car_sessions = {c['id']: _used.get(c['id'], 0) for c in cars}
 
     # 4. Allocation Loop
     for car in cars:
@@ -91,7 +93,7 @@ def smart_heuristic_schedule(prices, cars, current_idx=0):
         # individual cheap slots that each become their own "session".
         available = []
         for t in range(current_idx, min(departure, total_intervals)):
-            if station_load[t] < STATION_CAPACITY and prices[t] <= price_limit:
+            if station_load[t] < _capacity and prices[t] <= price_limit:
                 available.append(t)
 
         # Emergency: just charge immediately, cheapest window second
@@ -130,7 +132,7 @@ def smart_heuristic_schedule(prices, cars, current_idx=0):
             for t in window:
                 if current_soc >= target_soc:
                     break
-                if station_load[t] < STATION_CAPACITY:
+                if station_load[t] < _capacity:
                     energy_added = MAX_POWER_PER_CHARGER * 0.25
                     current_kwh  = min(CAR_BATTERY_CAPACITY_KWH,
                                        current_kwh + energy_added)

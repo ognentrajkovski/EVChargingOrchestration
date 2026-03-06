@@ -354,7 +354,7 @@ BOOTSTRAP_SERVERS      = os.environ.get('KAFKA_BOOTSTRAP_SERVERS', 'localhost:90
 TOPIC_ENERGY           = 'energy_data'
 TOPIC_CARS             = 'cars_real'
 TOPIC_COMMANDS         = 'charging_commands'
-SIM_MINUTES_PER_REAL_SEC = 12   # 1 real sec = 6 sim min → full day = 240 real sec
+SIM_MINUTES_PER_REAL_SEC = 12   # 1 real sec = 12 sim min → full day = 120 real sec
 
 # ── Session State ──────────────────────────────────────────────────────────────
 defaults = {
@@ -366,11 +366,18 @@ defaults = {
     'tomorrow_prices_96': [],        # exactly 96 slots for tomorrow's heatmap (TOMORROW label)
     'cars': {},
     'charging_plans': {},            # car_id → list of planned interval indices (0-191)
+    'flink_interval_idx': None,      # latest interval_idx reported by Flink — used to sync cur_idx
     'kafka_ready': False,
     'total_messages': 0,
     'poll_count': 0,
     'last_error': None,
     'topic_counts': {'energy_data': 0, 'cars_real': 0, 'charging_commands': 0},
+    'last_energy_batch_wall': None,  # wall-clock time when last TOMORROW batch completed (96 msgs)
+    'next_batch_interval': 159,      # real seconds between TOMORROW batches (actual sim-day on ARM64 Docker)
+    'today_charging_cost': 0.0,      # EUR spent on charging today — smart cars (resets at midnight)
+    'total_charging_cost': 0.0,      # EUR spent on charging all-time — smart cars
+    'today_test_cost': 0.0,          # EUR spent on charging today — naive test cars
+    'total_test_cost': 0.0,          # EUR spent on charging all-time — naive test cars
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -443,6 +450,10 @@ def poll_kafka():
                     if msg_type == 'TOMORROW' and len(st.session_state['tomorrow_prices_96']) == 1:
                         st.session_state['sim_start_wall'] = time.time()
                         st.session_state['sim_start_mins'] = 13 * 60
+                    # Record wall-clock time when each TOMORROW batch completes (all 96 msgs)
+                    # so the countdown timer can show seconds until the next batch.
+                    if msg_type == 'TOMORROW' and len(st.session_state['tomorrow_prices_96']) % 96 == 0 and len(st.session_state['tomorrow_prices_96']) > 0:
+                        st.session_state['last_energy_batch_wall'] = time.time()
 
                 elif topic == TOPIC_CARS:
                     car_id = data['id']
@@ -454,8 +465,48 @@ def poll_kafka():
                     st.session_state['topic_counts']['charging_commands'] += 1
                     car_id = data.get('car_id')
                     plan   = data.get('plan', [])
-                    if car_id and plan:
-                        intervals = [s['interval'] for s in plan]
+                    interval_idx = data.get('interval_idx')
+                    if interval_idx is not None:
+                        prev_idx = st.session_state.get('flink_interval_idx')
+                        # Detect midnight: idx resets to 0 from any value > 0.
+                        # Checking only prev==95 is fragile — the poll cycle can miss that
+                        # exact message, leaving prev at 94 or 93 when 0 arrives.
+                        if prev_idx is not None and prev_idx > 0 and interval_idx == 0:
+                            if st.session_state['tomorrow_prices_96']:
+                                st.session_state['today_prices_96']    = st.session_state['tomorrow_prices_96'][:]
+                                st.session_state['tomorrow_prices_96'] = []
+                                _dash_log('MIDNIGHT SYNC — today/tomorrow prices rotated from Flink signal')
+                            # Clear stale yesterday intervals from plans so today starts fresh
+                            for cid in list(st.session_state['charging_plans'].keys()):
+                                st.session_state['charging_plans'][cid] = [
+                                    i - 96 for i in st.session_state['charging_plans'][cid] if i >= 96
+                                ]
+                            st.session_state['day_count'] = st.session_state['day_count'] + 1
+                            st.session_state['today_charging_cost'] = 0.0
+                            st.session_state['today_test_cost']     = 0.0
+                        st.session_state['flink_interval_idx'] = interval_idx
+                    # Accumulate charging cost from START_CHARGING events
+                    action         = data.get('action')
+                    charging_price = data.get('charging_price')
+                    if action == 'START_CHARGING' and charging_price is not None:
+                        # 11 kW × 0.25 h = 2.75 kWh per interval; price in EUR/MWh → EUR
+                        cost = charging_price * 2.75 / 1000.0
+                        if car_id and car_id.endswith('_test'):
+                            st.session_state['today_test_cost']  += cost
+                            st.session_state['total_test_cost']  += cost
+                        else:
+                            st.session_state['today_charging_cost'] += cost
+                            st.session_state['total_charging_cost'] += cost
+                    if car_id:
+                        new_intervals = [s['interval'] for s in plan]
+                        flink_idx_now = data.get('interval_idx', 0)
+                        existing      = st.session_state['charging_plans'].get(car_id, [])
+                        # Preserve past today slots as display history (dark teal).
+                        # Replace future today and all tomorrow slots with Flink's latest plan.
+                        past_today = [i for i in existing if i < 96 and i < flink_idx_now]
+                        today_new  = [i for i in new_intervals if i < 96]
+                        tmrw_new   = [i for i in new_intervals if i >= 96]
+                        intervals  = sorted(set(past_today + today_new + tmrw_new))
                         st.session_state['charging_plans'][car_id] = intervals
                         _dash_log(f"PLAN received | {car_id} | {len(intervals)} slots | first8={intervals[:8]}")
 
@@ -486,18 +537,15 @@ def slot_color_for_car(t, planned_slots, prices, p10, p30, p70):
         return '#1e2d3d'
     return '#131e2b'
 
-# ── Advance sim clock (wall-clock anchored — no drift) ────────────────────────
+# ── Advance sim clock (wall-clock anchored — display only) ───────────────────
+# IMPORTANT: day_count and today/tomorrow price rotation are handled EXCLUSIVELY
+# by Flink's interval_idx==0 signal in poll_kafka(). The wall-clock anchor
+# (sim_start_wall) can be stale across deploy runs, so we never trigger price
+# shifts or day increments here — only update the display sim_time_minutes.
 def advance_clock():
     elapsed_real_secs = time.time() - st.session_state['sim_start_wall']
     total_sim_mins    = st.session_state['sim_start_mins'] + elapsed_real_secs * SIM_MINUTES_PER_REAL_SEC
-    days_elapsed      = int(total_sim_mins // 1440)
     st.session_state['sim_time_minutes'] = int(total_sim_mins % 1440)
-    # Track day rollovers by comparing against stored day count
-    expected_day = 1 + days_elapsed
-    if expected_day > st.session_state['day_count']:
-        st.session_state['day_count'] = expected_day
-        st.session_state['today_prices_96']    = st.session_state['tomorrow_prices_96'][:]
-        st.session_state['tomorrow_prices_96'] = []
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  POLL FIRST — so first frame already has data
@@ -520,10 +568,17 @@ if has_prices:
     p70 = float(np.percentile(ref_prices, 70))
 
 # ── Sim time ───────────────────────────────────────────────────────────────────
-hours    = st.session_state['sim_time_minutes'] // 60
-mins     = st.session_state['sim_time_minutes'] % 60
+# Prefer Flink's own interval counter — avoids wall-clock drift vs Flink's processing timer
+flink_idx = st.session_state.get('flink_interval_idx')
+if flink_idx is not None:
+    cur_idx  = flink_idx
+    _sim_mins = flink_idx * 15
+else:
+    cur_idx   = st.session_state['sim_time_minutes'] // 15
+    _sim_mins = st.session_state['sim_time_minutes']
+hours    = _sim_mins // 60
+mins     = _sim_mins % 60
 time_str = f"{hours:02d}:{mins:02d}"
-cur_idx  = st.session_state['sim_time_minutes'] // 15   # current 15-min interval
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  LAYOUT
@@ -552,6 +607,20 @@ st.markdown(f"""
 charging_count = sum(1 for c in st.session_state['cars'].values() if c.get('plugged_in'))
 last_price     = prices[-1] if prices else (ref_prices[-1] if ref_prices else None)
 price_col      = '#ff4b4b' if has_prices and last_price > p70 else '#26de81' if has_prices and last_price <= p30 else '#fed330'
+
+# ── Next-batch countdown ──
+_last_batch = st.session_state.get('last_energy_batch_wall')
+if _last_batch is not None:
+    _elapsed   = time.time() - _last_batch
+    _remaining = max(0.0, st.session_state['next_batch_interval'] - _elapsed)
+    _mins      = int(_remaining) // 60
+    _secs      = int(_remaining) % 60
+    _cdval     = f"{_mins}:{_secs:02d}"
+    _cdcol     = '#26de81' if _remaining > 30 else '#fed330' if _remaining > 10 else '#ff4b4b'
+    _cd_cell   = f'<div class="clock-cell"><div class="clock-label">Next Energy Batch</div><div class="clock-val" style="color:{_cdcol}">{_cdval}</div></div>'
+else:
+    _cd_cell   = '<div class="clock-cell"><div class="clock-label">Next Energy Batch</div><div class="clock-val" style="color:#2d4a62">—</div></div>'
+
 st.markdown(f"""
 <div class="clock-strip">
   <div class="clock-cell">
@@ -574,6 +643,7 @@ st.markdown(f"""
     <div class="clock-label">Current Price</div>
     <div class="clock-val" style="color:{price_col}">{'—' if not has_prices else f'{last_price:.0f} <span style="font-size:1rem">€</span>'}</div>
   </div>
+  {_cd_cell}
 </div>
 """, unsafe_allow_html=True)
 
@@ -650,11 +720,14 @@ with left_col:
     # ── 96-slot day heatmap ──
     st.markdown('<div class="section-hdr">Today\'s Price Map — 96 × 15-min Intervals</div>', unsafe_allow_html=True)
 
-    # Fallback: if TODAY buffer is empty (old producer only sent TOMORROW), use rolling prices
-    effective_today = today_p96 if today_p96 else prices[:96]
-    for map_label, map_prices in [("TODAY", effective_today), ("TOMORROW", tomorrow_p96)]:
+    # TODAY prices only exist after the first midnight shift (producer sends TOMORROW only).
+    # Never fall back to rolling prices — that makes today and tomorrow look identical.
+    for map_label, map_prices in [("TODAY", today_p96), ("TOMORROW", tomorrow_p96)]:
         if not map_prices:
-            st.caption(f"{map_label}: waiting for data…")
+            if map_label == "TODAY":
+                st.caption("TODAY: prices available after midnight — showing tomorrow's preview below")
+            else:
+                st.caption("TOMORROW: waiting for 13:00 market clearing…")
             continue
         slots_html = f'<div style="font-family:Share Tech Mono,monospace;font-size:0.65rem;color:#4a6070;margin-bottom:3px">{map_label}</div>'
         slots_html += '<div class="sched-row">'
@@ -670,35 +743,81 @@ with left_col:
     # ── Per-car charging schedule ──
     st.markdown('<div class="section-hdr">Planned Charging Schedules (Flink Output)</div>', unsafe_allow_html=True)
 
+    _today_smart = st.session_state['today_charging_cost']
+    _total_smart = st.session_state['total_charging_cost']
+    _today_test  = st.session_state['today_test_cost']
+    _total_test  = st.session_state['total_test_cost']
+    _saved_today = _today_test  - _today_smart
+    _saved_total = _total_test  - _total_smart
+    st.markdown(
+        f'<div style="font-family:Share Tech Mono,monospace;font-size:0.75rem;color:#cfd8dc;margin-bottom:6px">'
+        f'⚡ Smart — Today: <span style="color:#00e5ff">€{_today_smart:.4f}</span>'
+        f'&nbsp; Total: <span style="color:#00e5ff">€{_total_smart:.4f}</span>'
+        f'&nbsp;&nbsp;|&nbsp;&nbsp;'
+        f'🔋 Naive — Today: <span style="color:#ff5252">€{_today_test:.4f}</span>'
+        f'&nbsp; Total: <span style="color:#ff5252">€{_total_test:.4f}</span>'
+        f'&nbsp;&nbsp;&nbsp;&nbsp; <br>'
+        f'💰 Saved — Today: <span style="color:#26de81">€{_saved_today:.4f}</span>'
+        f'&nbsp; Total: <span style="color:#26de81">€{_saved_total:.4f}</span>'
+        f'</div>',
+        unsafe_allow_html=True
+    )
+
     plans = st.session_state['charging_plans']
     if plans:
-        for day_label, price_buf, offset in [("TODAY", today_p96, 0), ("TOMORROW", tomorrow_p96, 96)]:
-            st.markdown(f'<div style="font-family:Share Tech Mono,monospace;font-size:0.65rem;color:#4a6070;margin:4px 0 2px">{day_label}</div>', unsafe_allow_html=True)
-            for car_id, planned_slots in sorted(plans.items()):
-                planned_set = set(planned_slots)
-                row_html = f'<div style="margin-bottom:3px"><span style="font-family:Share Tech Mono,monospace;font-size:0.68rem;color:#7b9bb5;display:inline-block;width:60px">{car_id}</span>'
-                row_html += '<div class="sched-row" style="display:inline-flex">'
-                for t in range(96):
-                    abs_t = t + offset  # absolute interval index (0-95 today, 96-191 tomorrow)
-                    if abs_t in planned_set:
-                        bg = '#00e5ff'
-                    elif t < len(price_buf) and price_buf[t] <= p30:
-                        bg = '#26de8130'
-                    else:
-                        bg = '#1e2d3d'
-                    active = ' outline: 1px solid #fff3;' if (offset == 0 and t == cur_idx) else ''
-                    row_html += f'<div class="sched-slot" style="background:{bg};{active}"></div>'
-                row_html += '</div></div>'
-                st.markdown(row_html, unsafe_allow_html=True)
+        # Before midnight today_p96 is empty — the pre-midnight plan uses intervals 0-95
+        # which represent TOMORROW's schedule, so display it under TOMORROW not TODAY.
+        pre_midnight = len(today_p96) == 0
+        if pre_midnight:
+            day_rows = [("TOMORROW — pre-planned", tomorrow_p96, 0)]
+        else:
+            day_rows = [("TODAY", today_p96, 0), ("TOMORROW", tomorrow_p96, 96)]
+
+        for day_label, price_buf, offset in day_rows:
+            real_plans = {k: v for k, v in sorted(plans.items()) if not k.endswith('_test')}
+
+            def render_sched_group(group_plans, group_label, label_color):
+                if not group_plans:
+                    return
+                st.markdown(
+                    f'<div style="font-family:Share Tech Mono,monospace;font-size:0.65rem;'
+                    f'color:{label_color};margin:6px 0 2px">{day_label} &nbsp;·&nbsp; {group_label}</div>',
+                    unsafe_allow_html=True)
+                for car_id, planned_slots in group_plans.items():
+                    planned_set = set(planned_slots)
+                    row_html = (f'<div style="margin-bottom:3px">'
+                                f'<span style="font-family:Share Tech Mono,monospace;font-size:0.68rem;'
+                                f'color:{label_color};display:inline-block;width:80px">{car_id}</span>'
+                                f'<div class="sched-row" style="display:inline-flex">')
+                    for t in range(96):
+                        abs_t   = t + offset
+                        is_past = (offset == 0 and t < cur_idx)
+                        if abs_t in planned_set:
+                            bg = '#005566' if is_past else '#00e5ff'
+                        elif t < len(price_buf) and price_buf[t] <= p30:
+                            bg = '#26de8130'
+                        else:
+                            bg = '#1e2d3d'
+                        active = ' outline: 1px solid #fff3;' if (offset == 0 and t == cur_idx) else ''
+                        row_html += f'<div class="sched-slot" style="background:{bg};{active}"></div>'
+                    row_html += '</div></div>'
+                    st.markdown(row_html, unsafe_allow_html=True)
+
+            render_sched_group(real_plans, '⚡ SMART SCHEDULER', '#00e5ff')
         st.markdown("""
         <div class="legend-row" style="margin-top:0.4rem">
-          <span><span class="legend-dot" style="background:#00e5ff"></span>Planned charge</span>
+          <span><span class="legend-dot" style="background:#00e5ff"></span>Planned charge (upcoming)</span>
+          <span><span class="legend-dot" style="background:#005566"></span>Charged (past)</span>
           <span><span class="legend-dot" style="background:#26de81;opacity:0.4"></span>Cheap window (not scheduled)</span>
           <span><span class="legend-dot" style="background:#1e2d3d"></span>No action</span>
         </div>
         """, unsafe_allow_html=True)
     else:
-        st.caption("Charging plans appear once Flink starts emitting commands…")
+        cmds = st.session_state['topic_counts']['charging_commands']
+        if cmds == 0:
+            st.warning("No charging commands received yet — is the Flink job running?  (CMDS received: 0)")
+        else:
+            st.caption(f"Commands received ({cmds}) but no car_id found — check Flink output format")
 
 
 # ═══════════════════════════════════════════════
@@ -709,74 +828,91 @@ with right_col:
 
     cars = st.session_state['cars']
     if cars:
-        # Build ALL cards as one HTML string — Streamlit's parser handles
-        # a single large block much more reliably than many small ones.
-        all_cards_html = ""
+        real_cars_map = {k: v for k, v in sorted(cars.items()) if not k.endswith('_test')}
+        test_cars_map = {k: v for k, v in sorted(cars.items()) if k.endswith('_test')}
 
-        for car_id, car in sorted(cars.items()):
-            try:
-                soc         = float(car.get('current_soc', 0.0))
-                soc_pct     = round(soc * 100, 1)
-                plugged     = bool(car.get('plugged_in', False))
-                priority    = str(car.get('priority', '-'))
-                kwh         = float(car.get('current_battery_kwh', 0.0))
-                fill_color  = soc_color(soc)
-                is_critical = soc < 0.15
-                card_cls    = 'charging' if plugged else ('critical' if is_critical else '')
-                batt_cls    = 'charging' if plugged else ''
+        for group_cars, group_label, group_color in [
+            (real_cars_map, '⚡ Smart Scheduler', '#00e5ff'),
+            (test_cars_map,  '🔋 Naive (no schedule)', '#ff5252'),
+        ]:
+            if not group_cars:
+                continue
+            st.markdown(
+                f'<div style="font-family:Share Tech Mono,monospace;font-size:0.65rem;'
+                f'color:{group_color};margin:8px 0 4px;border-bottom:1px solid {group_color}33;'
+                f'padding-bottom:3px">{group_label}</div>',
+                unsafe_allow_html=True)
 
-                if plugged:
-                    badge_html = 'Charging'
-                    badge_cls  = 'badge-charging'
-                    badge_icon = '&#9889;'
-                elif is_critical:
-                    badge_html = 'Critical'
-                    badge_cls  = 'badge-critical'
-                    badge_icon = '&#9888;'
-                else:
-                    badge_html = 'Idle'
-                    badge_cls  = 'badge-idle'
-                    badge_icon = '&#9679;'
+            all_cards_html = ""
+            for car_id, car in group_cars.items():
+                try:
+                    soc         = float(car.get('current_soc', 0.0))
+                    soc_pct     = round(soc * 100, 1)
+                    plugged     = bool(car.get('plugged_in', False))
+                    priority    = str(car.get('priority', '-'))
+                    kwh         = float(car.get('current_battery_kwh', 0.0))
+                    fill_color  = soc_color(soc)
+                    is_critical = soc < 0.15
+                    card_cls    = 'charging' if plugged else ('critical' if is_critical else '')
+                    batt_cls    = 'charging' if plugged else ''
 
-                rate_html = '<span style="font-size:0.7rem;color:#00e5ff;font-family:Share Tech Mono,monospace"> +11.0 kW</span>' if plugged else ''
-
-                plan_set = set(st.session_state['charging_plans'].get(car_id, []))
-                slots_html = ""
-                for t in range(cur_idx, min(cur_idx + 32, 96)):
-                    if t in plan_set:
-                        bg = '#00e5ff'
-                    elif t < len(today_p96) and today_p96[t] <= p30:
-                        bg = '#26de8140'
+                    if plugged:
+                        badge_html = 'Charging'
+                        badge_cls  = 'badge-charging'
+                        badge_icon = '&#9889;'
+                    elif is_critical:
+                        badge_html = 'Critical'
+                        badge_cls  = 'badge-critical'
+                        badge_icon = '&#9888;'
                     else:
-                        bg = '#1e2d3d'
-                    slots_html += f'<div class="sched-slot" style="background:{bg};width:8px;display:inline-block"></div>'
+                        badge_html = 'Idle'
+                        badge_cls  = 'badge-idle'
+                        badge_icon = '&#9679;'
 
-                label = car_id.upper().replace("_", " ")
+                    rate_html = '<span style="font-size:0.7rem;color:#00e5ff;font-family:Share Tech Mono,monospace"> +11.0 kW</span>' if plugged else ''
 
-                all_cards_html += (
-                    f'<div class="car-card {card_cls}" style="margin-bottom:0.7rem">'
-                        f'<div style="display:flex;justify-content:space-between">'
-                            f'<div>'
-                                f'<div class="car-id">{label}</div>'
-                                f'<div class="car-soc-num" style="color:{fill_color}">{soc_pct}'
-                                    f'<span style="font-size:1rem;color:#4a6070"> %</span>'
-                                    f'{rate_html}'
-                                f'</div>'
-                                f'<div class="car-meta">{kwh:.1f} kWh &nbsp;·&nbsp; Priority {priority}</div>'
-                            f'</div>'
-                            f'<div><span class="badge {badge_cls}">{badge_icon} {badge_html}</span></div>'
-                        f'</div>'
-                        f'<div class="batt-track">'
-                            f'<div class="batt-fill {batt_cls}" style="width:{soc_pct}%;background:{fill_color}"></div>'
-                        f'</div>'
+                    slots_html = ""
+                    if not car_id.endswith('_test'):
+                        plan_set = set(st.session_state['charging_plans'].get(car_id, []))
+                        card_price_buf = today_p96 if today_p96 else tomorrow_p96
+                        for t in range(cur_idx, min(cur_idx + 32, 96)):
+                            if t in plan_set:
+                                bg = '#00e5ff'
+                            elif t < len(card_price_buf) and card_price_buf[t] <= p30:
+                                bg = '#26de8140'
+                            else:
+                                bg = '#1e2d3d'
+                            slots_html += f'<div class="sched-slot" style="background:{bg};width:8px;display:inline-block"></div>'
+
+                    label = car_id.upper().replace("_", " ")
+
+                    plan_section = (
                         f'<div style="font-size:0.65rem;color:#4a6070;font-family:Share Tech Mono,monospace;margin:0.3rem 0 0.2rem">NEXT 8h PLAN</div>'
                         f'<div style="display:flex;flex-wrap:wrap;gap:2px">{slots_html}</div>'
-                    f'</div>'
-                )
-            except Exception as e:
-                all_cards_html += f'<div style="color:#ff4b4b;font-size:0.8rem;padding:0.5rem">Error [{car_id}]: {e}</div>'
+                    ) if slots_html else ''
+                    all_cards_html += (
+                        f'<div class="car-card {card_cls}" style="margin-bottom:0.7rem">'
+                            f'<div style="display:flex;justify-content:space-between">'
+                                f'<div>'
+                                    f'<div class="car-id">{label}</div>'
+                                    f'<div class="car-soc-num" style="color:{fill_color}">{soc_pct}'
+                                        f'<span style="font-size:1rem;color:#4a6070"> %</span>'
+                                        f'{rate_html}'
+                                    f'</div>'
+                                    f'<div class="car-meta">{kwh:.1f} kWh &nbsp;·&nbsp; Priority {priority}</div>'
+                                f'</div>'
+                                f'<div><span class="badge {badge_cls}">{badge_icon} {badge_html}</span></div>'
+                            f'</div>'
+                            f'<div class="batt-track">'
+                                f'<div class="batt-fill {batt_cls}" style="width:{soc_pct}%;background:{fill_color}"></div>'
+                            f'</div>'
+                            f'{plan_section}'
+                        f'</div>'
+                    )
+                except Exception as e:
+                    all_cards_html += f'<div style="color:#ff4b4b;font-size:0.8rem;padding:0.5rem">Error [{car_id}]: {e}</div>'
 
-        st.markdown(all_cards_html, unsafe_allow_html=True)
+            st.markdown(all_cards_html, unsafe_allow_html=True)
     else:
         st.info("Waiting for car telemetry...")
         st.caption(f"Consumer ready: {st.session_state['kafka_ready']} | Messages: {st.session_state['total_messages']}")

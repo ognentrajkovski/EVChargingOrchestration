@@ -24,7 +24,7 @@ class Car:
         self.priority = priority
         self.k = k
         self.is_charging = False
-        self.is_parked = True   # Cars start at station so Flink can see them immediately
+        self.is_parked = False  # Cars start driving; Flink will send START_CHARGING when a plan slot arrives
 
     def update(self):
         if self.is_charging:
@@ -96,16 +96,16 @@ def main():
         value_serializer=lambda v: json.dumps(v).encode('utf-8')
     )
 
-    # Initialize cars
+    # Initialize cars — real group + identical test group with same parameters
     for i in range(1, NUM_CARS + 1):
         start_battery = random.uniform(85.0, 100.0)
         priority = random.randint(1, 5)
         discharge_k = random.uniform(0.4, 1.0)  # % per tick (2.5s)
 
-        car = Car(f"car_{i}", "real", start_battery, priority, discharge_k)
-        cars_map[f"car_{i}"] = car
+        cars_map[f"car_{i}"]      = Car(f"car_{i}",      "real", start_battery, priority, discharge_k)
+        cars_map[f"car_{i}_test"] = Car(f"car_{i}_test", "test", start_battery, priority, discharge_k)
 
-    print(f"Initialized {NUM_CARS} cars.")
+    print(f"Initialized {NUM_CARS} real + {NUM_CARS} test cars (identical parameters).")
 
     # Start Consumer Thread
     t = threading.Thread(target=consume_commands, daemon=True)
