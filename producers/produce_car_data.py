@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ev_logger import log, log_error
 
 # Configuration
-NUM_CARS = 1
+NUM_CARS = 10
 UPDATE_INTERVAL = 1.25
 TOPIC_REAL = "cars_real"
 TOPIC_COMMANDS = "charging_commands"

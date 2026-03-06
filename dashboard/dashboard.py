@@ -378,6 +378,10 @@ defaults = {
     'total_charging_cost': 0.0,      # EUR spent on charging all-time — smart cars
     'today_test_cost': 0.0,          # EUR spent on charging today — naive test cars
     'total_test_cost': 0.0,          # EUR spent on charging all-time — naive test cars
+    'today_driven_real': 0.0,        # sim-hours driven today — smart cars
+    'total_driven_real': 0.0,        # sim-hours driven all-time — smart cars
+    'today_driven_test': 0.0,        # sim-hours driven today — naive test cars
+    'total_driven_test': 0.0,        # sim-hours driven all-time — naive test cars
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -460,6 +464,14 @@ def poll_kafka():
                     st.session_state['cars'][car_id] = data
                     st.session_state['topic_counts']['cars_real'] += 1
                     _dash_log(f"CAR | {car_id} | soc={data.get('current_soc',0)*100:.1f}% | plugged={data.get('plugged_in')}")
+                    # Accumulate driven time: each tick = 15 sim-min = 0.25 sim-hours
+                    if not data.get('plugged_in', False):
+                        if car_id.endswith('_test'):
+                            st.session_state['today_driven_test'] += 0.25
+                            st.session_state['total_driven_test'] += 0.25
+                        else:
+                            st.session_state['today_driven_real'] += 0.25
+                            st.session_state['total_driven_real'] += 0.25
 
                 elif topic == TOPIC_COMMANDS:
                     st.session_state['topic_counts']['charging_commands'] += 1
@@ -484,6 +496,8 @@ def poll_kafka():
                             st.session_state['day_count'] = st.session_state['day_count'] + 1
                             st.session_state['today_charging_cost'] = 0.0
                             st.session_state['today_test_cost']     = 0.0
+                            st.session_state['today_driven_real']   = 0.0
+                            st.session_state['today_driven_test']   = 0.0
                         st.session_state['flink_interval_idx'] = interval_idx
                     # Accumulate charging cost from START_CHARGING events
                     action         = data.get('action')
@@ -743,19 +757,25 @@ with left_col:
     # ── Per-car charging schedule ──
     st.markdown('<div class="section-hdr">Planned Charging Schedules (Flink Output)</div>', unsafe_allow_html=True)
 
-    _today_smart = st.session_state['today_charging_cost']
-    _total_smart = st.session_state['total_charging_cost']
-    _today_test  = st.session_state['today_test_cost']
-    _total_test  = st.session_state['total_test_cost']
-    _saved_today = _today_test  - _today_smart
-    _saved_total = _total_test  - _total_smart
+    _today_smart  = st.session_state['today_charging_cost']
+    _total_smart  = st.session_state['total_charging_cost']
+    _today_test   = st.session_state['today_test_cost']
+    _total_test   = st.session_state['total_test_cost']
+    _saved_today  = _today_test  - _today_smart
+    _saved_total  = _total_test  - _total_smart
+    _dr_today_r   = st.session_state['today_driven_real']
+    _dr_total_r   = st.session_state['total_driven_real']
+    _dr_today_t   = st.session_state['today_driven_test']
+    _dr_total_t   = st.session_state['total_driven_test']
     st.markdown(
         f'<div style="font-family:Share Tech Mono,monospace;font-size:0.75rem;color:#cfd8dc;margin-bottom:6px">'
         f'⚡ Smart — Today: <span style="color:#00e5ff">€{_today_smart:.4f}</span>'
         f'&nbsp; Total: <span style="color:#00e5ff">€{_total_smart:.4f}</span>'
-        f'&nbsp;&nbsp;|&nbsp;&nbsp;'
+        f'&nbsp; Driven: <span style="color:#00e5ff">{_dr_today_r:.1f}h today / {_dr_total_r:.1f}h total</span>'
+        f'&nbsp;&nbsp;&nbsp;&nbsp;<br>'
         f'🔋 Naive — Today: <span style="color:#ff5252">€{_today_test:.4f}</span>'
         f'&nbsp; Total: <span style="color:#ff5252">€{_total_test:.4f}</span>'
+        f'&nbsp; Driven: <span style="color:#ff5252">{_dr_today_t:.1f}h today / {_dr_total_t:.1f}h total</span>'
         f'&nbsp;&nbsp;&nbsp;&nbsp; <br>'
         f'💰 Saved — Today: <span style="color:#26de81">€{_saved_today:.4f}</span>'
         f'&nbsp; Total: <span style="color:#26de81">€{_saved_total:.4f}</span>'
