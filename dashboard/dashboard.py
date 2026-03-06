@@ -619,7 +619,8 @@ st.markdown(f"""
 
 # ── Clock strip ────────────────────────────────────────────────────────────────
 charging_count = sum(1 for c in st.session_state['cars'].values() if c.get('plugged_in'))
-last_price     = prices[-1] if prices else (ref_prices[-1] if ref_prices else None)
+last_price     = (today_p96[cur_idx] if today_p96 and cur_idx < len(today_p96)
+                  else (prices[-1] if prices else (ref_prices[-1] if ref_prices else None)))
 price_col      = '#ff4b4b' if has_prices and last_price > p70 else '#26de81' if has_prices and last_price <= p30 else '#fed330'
 
 # ── Next-batch countdown ──
@@ -722,12 +723,10 @@ with left_col:
         st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
 
         # percentile reference metrics
-        m1, m2, m3, m4 = st.columns(4)
+        m1, m2, m3 = st.columns(3)
         m1.metric("p10 — Very Cheap", f"{p10:.1f} €")
         m2.metric("p30 — Cheap",      f"{p30:.1f} €")
         m3.metric("p70 — Normal",     f"{p70:.1f} €")
-        last_price = prices[-1] if prices else (ref_prices[-1] if ref_prices else None)
-        m4.metric("Current", f"{last_price:.1f} €" if last_price is not None else "—")
     else:
         st.info("⏳ Waiting for energy price data…")
 
@@ -738,10 +737,10 @@ with left_col:
     # Never fall back to rolling prices — that makes today and tomorrow look identical.
     for map_label, map_prices in [("TODAY", today_p96), ("TOMORROW", tomorrow_p96)]:
         if not map_prices:
-            if map_label == "TODAY":
-                st.caption("TODAY: prices available after midnight — showing tomorrow's preview below")
-            else:
-                st.caption("TOMORROW: waiting for 13:00 market clearing…")
+            # if map_label == "TODAY":
+            #     st.caption("TODAY: prices available after midnight — showing tomorrow's preview below")
+            # else:
+            #     st.caption("")
             continue
         slots_html = f'<div style="font-family:Share Tech Mono,monospace;font-size:0.65rem;color:#4a6070;margin-bottom:3px">{map_label}</div>'
         slots_html += '<div class="sched-row">'
@@ -752,7 +751,6 @@ with left_col:
             slots_html += f'<div class="sched-slot" style="background:{col_hex};{border}" title="{title}"></div>'
         slots_html += '</div>'
         st.markdown(slots_html, unsafe_allow_html=True)
-    st.caption("Each block = 15 min. Outlined block = current interval. Hover for time & price.")
 
     # ── Per-car charging schedule ──
     st.markdown('<div class="section-hdr">Planned Charging Schedules (Flink Output)</div>', unsafe_allow_html=True)
@@ -769,15 +767,15 @@ with left_col:
     _dr_total_t   = st.session_state['total_driven_test']
     st.markdown(
         f'<div style="font-family:Share Tech Mono,monospace;font-size:0.75rem;color:#cfd8dc;margin-bottom:6px">'
-        f'⚡ Smart — Today: <span style="color:#00e5ff">€{_today_smart:.4f}</span>'
+        f' Smart — Today: <span style="color:#00e5ff">€{_today_smart:.4f}</span>'
         f'&nbsp; Total: <span style="color:#00e5ff">€{_total_smart:.4f}</span>'
         f'&nbsp; Driven: <span style="color:#00e5ff">{_dr_today_r:.1f}h today / {_dr_total_r:.1f}h total</span>'
         f'&nbsp;&nbsp;&nbsp;&nbsp;<br>'
-        f'🔋 Naive — Today: <span style="color:#ff5252">€{_today_test:.4f}</span>'
+        f' Naive — Today: <span style="color:#ff5252">€{_today_test:.4f}</span>'
         f'&nbsp; Total: <span style="color:#ff5252">€{_total_test:.4f}</span>'
         f'&nbsp; Driven: <span style="color:#ff5252">{_dr_today_t:.1f}h today / {_dr_total_t:.1f}h total</span>'
         f'&nbsp;&nbsp;&nbsp;&nbsp; <br>'
-        f'💰 Saved — Today: <span style="color:#26de81">€{_saved_today:.4f}</span>'
+        f' Saved — Today: <span style="color:#26de81">€{_saved_today:.4f}</span>'
         f'&nbsp; Total: <span style="color:#26de81">€{_saved_total:.4f}</span>'
         f'</div>',
         unsafe_allow_html=True
