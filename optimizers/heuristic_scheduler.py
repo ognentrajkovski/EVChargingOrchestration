@@ -56,31 +56,31 @@ def smart_heuristic_schedule(prices, cars, current_idx=0, sessions_used=None, st
         price_limit = 999999.0
         min_blocks_needed = MIN_DURATION_BLOCKS
 
-        # Strategy A: Emergency (< 15%) — charge at any price
+        # Emergency (< 15%) — charge at any price
         if current_soc < 0.15:
             target_soc = 0.40
             price_limit = 999999.0
             min_blocks_needed = 1
 
-        # Strategy B: Low (15% - 40%) — charge at average price or below
+        # Low (15% - 40%) — charge at average price or below
         elif current_soc < 0.40:
             target_soc = 0.60
             price_limit = avg_price
             min_blocks_needed = 1
 
-        # Strategy C: Medium (40% - 60%) — charge only below average price
+        # Medium (40% - 60%) — charge only below average price
         elif current_soc < 0.60:
             target_soc = 0.80
             price_limit = avg_price * 0.9  # Strictly below average
             min_blocks_needed = 1
 
-        # Strategy D: High (60% - 80%) — charge only at bottom 10% cheapest
+        # High (60% - 80%) — charge only at bottom 10% cheapest
         elif current_soc < 0.80:
             target_soc = 1.00
             price_limit = very_low_price_threshold
             min_blocks_needed = 1
 
-        # Strategy E: Full (>= 80%) — charge only if price is negative
+        # Full (>= 80%) — charge only if price is negative
         else:
             target_soc = 1.00
             price_limit = 0.0  # Only negative prices

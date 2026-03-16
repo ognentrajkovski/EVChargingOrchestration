@@ -18,11 +18,15 @@ from pyflink.common import WatermarkStrategy
 
 # Import the Heuristic Scheduler
 from heuristic_scheduler import smart_heuristic_schedule, STATION_CAPACITY
+# from heuristic_scheduler import  STATION_CAPACITY
+# from lp_scheduler import smart_lp_schedule as smart_heuristic_schedule
+
 import sys, os
 # Try to import ev_logger — works locally and when registered via add_python_file()
 try:
     from ev_logger import log, log_price, log_schedule, log_command, log_charging_decision, log_error
 except ModuleNotFoundError:
+
     # Fallback: write to stderr so logs still appear in Flink TaskManager logs
     import logging as _logging
     _logging.basicConfig(level=_logging.INFO, format='%(asctime)s [%(name)s] %(message)s')

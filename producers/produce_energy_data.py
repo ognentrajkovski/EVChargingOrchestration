@@ -57,7 +57,7 @@ def get_flink_interval_idx():
                 return idx
         consumer.close()
     except Exception as e:
-        print(f"⚠️  Could not read Flink idx: {e}")
+        print(f"  Could not read Flink idx: {e}")
     return None
 
 
@@ -67,10 +67,10 @@ def create_producer():
             bootstrap_servers=BOOTSTRAP_SERVERS,
             value_serializer=lambda v: json.dumps(v).encode('utf-8')
         )
-        print(f"✅ Connected to Kafka at {BOOTSTRAP_SERVERS}")
+        print(f" Connected to Kafka at {BOOTSTRAP_SERVERS}")
         return producer
     except Exception as e:
-        print(f"❌ Failed to connect to Kafka: {e}")
+        print(f" Failed to connect to Kafka: {e}")
         sys.exit(1)
 
 
@@ -86,7 +86,7 @@ def send_batch(producer, df, start_index, label="TOMORROW"):
         batch_part2 = df.iloc[0: (96 - remaining)]
         batch = pd.concat([batch_part1, batch_part2])
 
-    print(f"📤 Sending 96 prices for {label}...")
+    print(f" Sending 96 prices for {label}...")
     prices_sent = []
     for _, row in batch.iterrows():
         record = row.to_dict()
@@ -101,18 +101,18 @@ def send_batch(producer, df, start_index, label="TOMORROW"):
 
 
 def main():
-    print("🚀 Energy Market Simulator Starting...")
-    print(f"📂 Looking for data at: {os.path.abspath(CSV_FILE_PATH)}")
+    print(" Energy Market Simulator Starting...")
+    print(f" Looking for data at: {os.path.abspath(CSV_FILE_PATH)}")
 
     try:
         df = pd.read_csv(CSV_FILE_PATH, sep=';')
-        print(f"✅ Loaded CSV with {len(df)} rows.")
+        print(f" Loaded CSV with {len(df)} rows.")
         if 'AT_price_day_ahead' not in df.columns:
-            print("❌ ERROR: Column 'AT_price_day_ahead' not found in CSV!")
+            print(" ERROR: Column 'AT_price_day_ahead' not found in CSV!")
             print(f"Found columns: {df.columns.tolist()}")
             return
     except FileNotFoundError:
-        print(f"❌ CRITICAL ERROR: File not found at {CSV_FILE_PATH}")
+        print(f" CRITICAL ERROR: File not found at {CSV_FILE_PATH}")
         print("Please check that 'data/Austria_Energy_Reports.csv' exists.")
         return
 
@@ -123,7 +123,7 @@ def main():
     # Instead of a fixed delay, read Flink's current interval_idx and compute
     # exactly how many real seconds remain until sim 13:00 (idx=52).
     # This guarantees the first batch arrives at 13:00 regardless of Docker startup time.
-    print("⏳ Reading Flink's current sim clock from charging_commands...")
+    print(" Reading Flink's current sim clock from charging_commands...")
     flink_idx = get_flink_interval_idx()
 
     if flink_idx is not None:
@@ -137,7 +137,7 @@ def main():
         _log(f"CLOCK_SYNC | flink_idx={flink_idx} | wait={wait_secs:.1f}s")
         time.sleep(wait_secs)
     else:
-        print(f"⚠️  Could not read Flink clock — using fallback {FALLBACK_DELAY}s delay")
+        print(f"  Could not read Flink clock — using fallback {FALLBACK_DELAY}s delay")
         time.sleep(FALLBACK_DELAY)
 
     print("\n--- Market Cleared (13:00) — sending Tomorrow's Prices ---")
@@ -147,7 +147,7 @@ def main():
 
     try:
         while True:
-            print(f"⏳ Waiting {INTERVAL_SECONDS}s for next Market Clearing (13:00)...")
+            print(f" Waiting {INTERVAL_SECONDS}s for next Market Clearing (13:00)...")
             time.sleep(INTERVAL_SECONDS)
 
             print("\n--- Market Cleared (13:00) ---")
