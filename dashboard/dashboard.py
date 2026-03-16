@@ -781,53 +781,146 @@ with left_col:
         unsafe_allow_html=True
     )
 
+    # ── Comparison charts: cost savings + driving hours ──
+    _chart_col1, _chart_col2 = st.columns(2)
+
+    with _chart_col1:
+        _cost_fig = go.Figure()
+        _cost_fig.add_trace(go.Bar(
+            name='Smart',
+            x=['Today', 'Total'],
+            y=[_today_smart, _total_smart],
+            marker_color='#00e5ff',
+            marker_line_width=0,
+        ))
+        _cost_fig.add_trace(go.Bar(
+            name='Naive',
+            x=['Today', 'Total'],
+            y=[_today_test, _total_test],
+            marker_color='#ff5252',
+            marker_line_width=0,
+        ))
+        _cost_fig.add_trace(go.Bar(
+            name='Saved',
+            x=['Today', 'Total'],
+            y=[max(0.0, _saved_today), max(0.0, _saved_total)],
+            marker_color='#26de81',
+            marker_line_width=0,
+        ))
+        _cost_fig.update_layout(
+            title=dict(text='Charging Cost (€)', font=dict(color='#8ba3bc', size=11), x=0),
+            barmode='group',
+            height=200,
+            paper_bgcolor='#0d1520', plot_bgcolor='#0d1520',
+            margin=dict(l=40, r=10, t=30, b=30),
+            legend=dict(font=dict(color='#4a6070', size=9), bgcolor='rgba(0,0,0,0)', orientation='h', y=-0.25),
+            xaxis=dict(tickfont=dict(color='#4a6070', size=9), gridcolor='#1e2d3d', linecolor='#1e2d3d'),
+            yaxis=dict(tickfont=dict(color='#4a6070', size=9), gridcolor='#1e2d3d', linecolor='#1e2d3d',
+                       tickprefix='€', zeroline=False),
+        )
+        st.plotly_chart(_cost_fig, use_container_width=True, config={'displayModeBar': False})
+
+    with _chart_col2:
+        _drive_fig = go.Figure()
+        _drive_fig.add_trace(go.Bar(
+            name='Smart',
+            x=['Today', 'Total'],
+            y=[_dr_today_r, _dr_total_r],
+            marker_color='#00e5ff',
+            marker_line_width=0,
+        ))
+        _drive_fig.add_trace(go.Bar(
+            name='Naive',
+            x=['Today', 'Total'],
+            y=[_dr_today_t, _dr_total_t],
+            marker_color='#ff5252',
+            marker_line_width=0,
+        ))
+        _drive_fig.update_layout(
+            title=dict(text='Driving Hours (sim-h)', font=dict(color='#8ba3bc', size=11), x=0),
+            barmode='group',
+            height=200,
+            paper_bgcolor='#0d1520', plot_bgcolor='#0d1520',
+            margin=dict(l=40, r=10, t=30, b=30),
+            legend=dict(font=dict(color='#4a6070', size=9), bgcolor='rgba(0,0,0,0)', orientation='h', y=-0.25),
+            xaxis=dict(tickfont=dict(color='#4a6070', size=9), gridcolor='#1e2d3d', linecolor='#1e2d3d'),
+            yaxis=dict(tickfont=dict(color='#4a6070', size=9), gridcolor='#1e2d3d', linecolor='#1e2d3d',
+                       ticksuffix='h', zeroline=False),
+        )
+        st.plotly_chart(_drive_fig, use_container_width=True, config={'displayModeBar': False})
+
     plans = st.session_state['charging_plans']
     if plans:
-        # Before midnight today_p96 is empty — the pre-midnight plan uses intervals 0-95
-        # which represent TOMORROW's schedule, so display it under TOMORROW not TODAY.
         pre_midnight = len(today_p96) == 0
         if pre_midnight:
             day_rows = [("TOMORROW — pre-planned", tomorrow_p96, 0)]
         else:
             day_rows = [("TODAY", today_p96, 0), ("TOMORROW", tomorrow_p96, 96)]
 
+        real_plans = {k: v for k, v in sorted(plans.items()) if not k.endswith('_test')}
+
+        # ── Hour ruler (shared across all day rows) ──
+        SLOT_W = 5   # px per 15-min slot
+        CAR_LBL_W = 60  # px for car label column
+        ruler_html = (f'<div style="display:flex;margin-left:{CAR_LBL_W}px;margin-bottom:2px">')
+        for h in range(0, 24, 3):
+            ruler_html += (
+                f'<div style="width:{SLOT_W * 12}px;flex-shrink:0;font-family:JetBrains Mono,monospace;'
+                f'font-size:0.55rem;color:#2d4a62;text-align:left">{h:02d}:00</div>'
+            )
+        ruler_html += '</div>'
+
         for day_label, price_buf, offset in day_rows:
-            real_plans = {k: v for k, v in sorted(plans.items()) if not k.endswith('_test')}
+            if not price_buf and offset >= 96:
+                continue  # skip tomorrow if no data yet
 
-            def render_sched_group(group_plans, group_label, label_color):
-                if not group_plans:
-                    return
-                st.markdown(
-                    f'<div style="font-family:Share Tech Mono,monospace;font-size:0.65rem;'
-                    f'color:{label_color};margin:6px 0 2px">{day_label} &nbsp;·&nbsp; {group_label}</div>',
-                    unsafe_allow_html=True)
-                for car_id, planned_slots in group_plans.items():
-                    planned_set = set(planned_slots)
-                    row_html = (f'<div style="margin-bottom:3px">'
-                                f'<span style="font-family:Share Tech Mono,monospace;font-size:0.68rem;'
-                                f'color:{label_color};display:inline-block;width:80px">{car_id}</span>'
-                                f'<div class="sched-row" style="display:inline-flex">')
-                    for t in range(96):
-                        abs_t   = t + offset
-                        is_past = (offset == 0 and t < cur_idx)
-                        if abs_t in planned_set:
-                            bg = '#005566' if is_past else '#00e5ff'
-                        elif t < len(price_buf) and price_buf[t] <= p30:
-                            bg = '#26de8130'
-                        else:
-                            bg = '#1e2d3d'
-                        active = ' outline: 1px solid #fff3;' if (offset == 0 and t == cur_idx) else ''
-                        row_html += f'<div class="sched-slot" style="background:{bg};{active}"></div>'
-                    row_html += '</div></div>'
-                    st.markdown(row_html, unsafe_allow_html=True)
+            sched_html = f'''
+            <div style="background:#080f1a;border:1px solid #0f1f30;border-radius:10px;
+                        padding:0.7rem 0.8rem;margin-bottom:0.6rem">
+              <div style="font-family:JetBrains Mono,monospace;font-size:0.62rem;color:#00e5ff;
+                          letter-spacing:0.12em;margin-bottom:6px;text-transform:uppercase">{day_label}</div>
+              {ruler_html}
+            '''
 
-            render_sched_group(real_plans, '⚡ SMART SCHEDULER', '#00e5ff')
+            for car_id, planned_slots in real_plans.items():
+                planned_set = set(planned_slots)
+                label = car_id.upper().replace('_', ' ')
+                sched_html += (
+                    f'<div style="display:flex;align-items:center;margin-bottom:3px">'
+                    f'<div style="width:{CAR_LBL_W}px;flex-shrink:0;font-family:JetBrains Mono,monospace;'
+                    f'font-size:0.6rem;color:#4a6070;white-space:nowrap;overflow:hidden;'
+                    f'text-overflow:ellipsis">{label}</div>'
+                    f'<div style="display:flex;gap:1px">'
+                )
+                for t in range(96):
+                    abs_t   = t + offset
+                    is_past = (offset == 0 and t < cur_idx)
+                    is_now  = (offset == 0 and t == cur_idx)
+                    if abs_t in planned_set:
+                        bg     = '#004455' if is_past else '#00e5ff'
+                        radius = '2px'
+                    elif t < len(price_buf) and price_buf[t] <= p30:
+                        bg     = '#26de8128'
+                        radius = '2px'
+                    else:
+                        bg     = '#111c2b'
+                        radius = '2px'
+                    outline = 'outline:1px solid #ffffff55;' if is_now else ''
+                    sched_html += (
+                        f'<div style="width:{SLOT_W}px;height:10px;background:{bg};'
+                        f'border-radius:{radius};flex-shrink:0;{outline}"></div>'
+                    )
+                sched_html += '</div></div>'
+
+            sched_html += '</div>'
+            st.markdown(sched_html, unsafe_allow_html=True)
+
         st.markdown("""
-        <div class="legend-row" style="margin-top:0.4rem">
-          <span><span class="legend-dot" style="background:#00e5ff"></span>Planned charge (upcoming)</span>
-          <span><span class="legend-dot" style="background:#005566"></span>Charged (past)</span>
-          <span><span class="legend-dot" style="background:#26de81;opacity:0.4"></span>Cheap window (not scheduled)</span>
-          <span><span class="legend-dot" style="background:#1e2d3d"></span>No action</span>
+        <div class="legend-row" style="margin-top:0.2rem">
+          <span><span class="legend-dot" style="background:#00e5ff"></span>Planned</span>
+          <span><span class="legend-dot" style="background:#004455"></span>Charged (past)</span>
+          <span><span class="legend-dot" style="background:#26de81;opacity:0.5"></span>Cheap window</span>
+          <span><span class="legend-dot" style="background:#111c2b"></span>No action</span>
         </div>
         """, unsafe_allow_html=True)
     else:
@@ -842,16 +935,56 @@ with left_col:
 #  RIGHT — Car Battery Cards
 # ═══════════════════════════════════════════════
 with right_col:
+    st.markdown('<div class="section-hdr">Charging Stations</div>', unsafe_allow_html=True)
+
+    STATION_CAPACITY = 5
+    cars = st.session_state['cars']
+    # Assign currently-charging real cars to station slots (sorted for stability)
+    _charging_real = sorted(
+        [cid for cid, c in cars.items() if not cid.endswith('_test') and c.get('plugged_in', False)]
+    )
+    _station_html = '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:1rem">'
+    for _slot in range(STATION_CAPACITY):
+        if _slot < len(_charging_real):
+            _cid   = _charging_real[_slot]
+            _soc   = float(cars[_cid].get('current_soc', 0.0)) * 100
+            _label = _cid.upper().replace('_', ' ')
+            _station_html += f'''
+            <div style="flex:1;min-width:70px;background:#080f1a;border:1px solid #00e5ff40;
+                        border-radius:10px;padding:0.6rem 0.5rem;text-align:center;
+                        box-shadow:0 0 10px #00e5ff18;animation:pulse-border 2.5s ease-in-out infinite">
+              <div style="font-size:1.3rem;margin-bottom:2px">⚡</div>
+              <div style="font-family:JetBrains Mono,monospace;font-size:0.6rem;color:#00e5ff;
+                          letter-spacing:0.08em;margin-bottom:4px">{_label}</div>
+              <div style="font-family:JetBrains Mono,monospace;font-size:1rem;color:#e2eaf4;
+                          font-weight:500">{_soc:.0f}<span style="font-size:0.65rem;color:#4a6070">%</span></div>
+              <div style="height:4px;background:#0a1525;border-radius:2px;margin-top:5px;overflow:hidden">
+                <div style="height:100%;width:{_soc:.0f}%;background:#00e5ff;border-radius:2px;
+                             background-size:200% auto;animation:batt-shimmer 2s linear infinite"></div>
+              </div>
+            </div>'''
+        else:
+            _station_html += f'''
+            <div style="flex:1;min-width:70px;background:#080f1a;border:1px solid #0f1f30;
+                        border-radius:10px;padding:0.6rem 0.5rem;text-align:center;opacity:0.5">
+              <div style="font-size:1.3rem;margin-bottom:2px;filter:grayscale(1)">🔌</div>
+              <div style="font-family:JetBrains Mono,monospace;font-size:0.6rem;color:#2d4a62;
+                          letter-spacing:0.08em;margin-bottom:4px">SLOT {_slot + 1}</div>
+              <div style="font-family:JetBrains Mono,monospace;font-size:0.8rem;color:#2d4a62">FREE</div>
+              <div style="height:4px;background:#0a1525;border-radius:2px;margin-top:5px"></div>
+            </div>'''
+    _station_html += '</div>'
+    st.markdown(_station_html, unsafe_allow_html=True)
+
     st.markdown('<div class="section-hdr">Fleet Status</div>', unsafe_allow_html=True)
 
-    cars = st.session_state['cars']
     if cars:
         real_cars_map = {k: v for k, v in sorted(cars.items()) if not k.endswith('_test')}
         test_cars_map = {k: v for k, v in sorted(cars.items()) if k.endswith('_test')}
 
         for group_cars, group_label, group_color in [
             (real_cars_map, '⚡ Smart Scheduler', '#00e5ff'),
-            (test_cars_map,  '🔋 Naive (no schedule)', '#ff5252'),
+            (test_cars_map,  ' Naive (no schedule)', '#ff5252'),
         ]:
             if not group_cars:
                 continue
@@ -864,67 +997,71 @@ with right_col:
             all_cards_html = ""
             for car_id, car in group_cars.items():
                 try:
-                    soc         = float(car.get('current_soc', 0.0))
-                    soc_pct     = round(soc * 100, 1)
-                    plugged     = bool(car.get('plugged_in', False))
-                    priority    = str(car.get('priority', '-'))
-                    kwh         = float(car.get('current_battery_kwh', 0.0))
-                    fill_color  = soc_color(soc)
+                    soc        = float(car.get('current_soc', 0.0))
+                    soc_pct    = round(soc * 100, 1)
+                    plugged    = bool(car.get('plugged_in', False))
+                    priority   = str(car.get('priority', '-'))
+                    kwh        = float(car.get('current_battery_kwh', 0.0))
+                    fill_color = soc_color(soc)
                     is_critical = soc < 0.15
-                    card_cls    = 'charging' if plugged else ('critical' if is_critical else '')
-                    batt_cls    = 'charging' if plugged else ''
+                    batt_cls   = 'charging' if plugged else ''
 
                     if plugged:
-                        badge_html = 'Charging'
+                        badge_html = '&#9889; CHG'
                         badge_cls  = 'badge-charging'
-                        badge_icon = '&#9889;'
                     elif is_critical:
-                        badge_html = 'Critical'
+                        badge_html = '&#9888; CRIT'
                         badge_cls  = 'badge-critical'
-                        badge_icon = '&#9888;'
                     else:
-                        badge_html = 'Idle'
+                        badge_html = '&#9679; IDLE'
                         badge_cls  = 'badge-idle'
-                        badge_icon = '&#9679;'
 
-                    rate_html = '<span style="font-size:0.7rem;color:#00e5ff;font-family:Share Tech Mono,monospace"> +11.0 kW</span>' if plugged else ''
-
+                    # Mini plan dots (next 24 slots = 6h)
                     slots_html = ""
                     if not car_id.endswith('_test'):
                         plan_set = set(st.session_state['charging_plans'].get(car_id, []))
                         card_price_buf = today_p96 if today_p96 else tomorrow_p96
-                        for t in range(cur_idx, min(cur_idx + 32, 96)):
+                        for t in range(cur_idx, min(cur_idx + 24, 96)):
                             if t in plan_set:
                                 bg = '#00e5ff'
                             elif t < len(card_price_buf) and card_price_buf[t] <= p30:
                                 bg = '#26de8140'
                             else:
                                 bg = '#1e2d3d'
-                            slots_html += f'<div class="sched-slot" style="background:{bg};width:8px;display:inline-block"></div>'
+                            slots_html += f'<div style="width:5px;height:5px;border-radius:1px;background:{bg};flex-shrink:0"></div>'
 
                     label = car_id.upper().replace("_", " ")
+                    border_col = '#00e5ff30' if plugged else ('#ff4b4b30' if is_critical else '#0f1f30')
+                    row_anim   = 'animation:pulse-border 2.5s ease-in-out infinite;' if plugged else (
+                                 'animation:critical-pulse 1.5s ease-in-out infinite;' if is_critical else '')
 
-                    plan_section = (
-                        f'<div style="font-size:0.65rem;color:#4a6070;font-family:Share Tech Mono,monospace;margin:0.3rem 0 0.2rem">NEXT 8h PLAN</div>'
-                        f'<div style="display:flex;flex-wrap:wrap;gap:2px">{slots_html}</div>'
-                    ) if slots_html else ''
                     all_cards_html += (
-                        f'<div class="car-card {card_cls}" style="margin-bottom:0.7rem">'
-                            f'<div style="display:flex;justify-content:space-between">'
-                                f'<div>'
-                                    f'<div class="car-id">{label}</div>'
-                                    f'<div class="car-soc-num" style="color:{fill_color}">{soc_pct}'
-                                        f'<span style="font-size:1rem;color:#4a6070"> %</span>'
-                                        f'{rate_html}'
-                                    f'</div>'
-                                    f'<div class="car-meta">{kwh:.1f} kWh &nbsp;·&nbsp; Priority {priority}</div>'
-                                f'</div>'
-                                f'<div><span class="badge {badge_cls}">{badge_icon} {badge_html}</span></div>'
-                            f'</div>'
-                            f'<div class="batt-track">'
-                                f'<div class="batt-fill {batt_cls}" style="width:{soc_pct}%;background:{fill_color}"></div>'
-                            f'</div>'
-                            f'{plan_section}'
+                        f'<div style="display:flex;align-items:center;gap:8px;padding:0.35rem 0.7rem;'
+                        f'margin-bottom:4px;background:#080f1a;border:1px solid {border_col};'
+                        f'border-radius:8px;{row_anim}">'
+                          # Car ID
+                          f'<div style="font-family:JetBrains Mono,monospace;font-size:0.62rem;'
+                          f'color:#4a6070;width:70px;flex-shrink:0;letter-spacing:0.06em">{label}</div>'
+                          # SOC %
+                          f'<div style="font-family:JetBrains Mono,monospace;font-size:0.9rem;'
+                          f'font-weight:500;color:{fill_color};width:44px;flex-shrink:0;text-align:right">'
+                          f'{soc_pct:.0f}<span style="font-size:0.6rem;color:#2d4a62">%</span></div>'
+                          # Battery bar
+                          f'<div style="flex:1;height:5px;background:#0a1525;border-radius:3px;overflow:hidden;min-width:40px">'
+                            f'<div class="batt-fill {batt_cls}" style="height:100%;width:{soc_pct}%;'
+                            f'background:{fill_color};border-radius:3px"></div>'
+                          f'</div>'
+                          # kWh
+                          f'<div style="font-family:JetBrains Mono,monospace;font-size:0.6rem;'
+                          f'color:#2d4a62;width:46px;flex-shrink:0;text-align:right">{kwh:.1f}kWh</div>'
+                          # Priority
+                          f'<div style="font-family:JetBrains Mono,monospace;font-size:0.6rem;'
+                          f'color:#4a6070;width:36px;flex-shrink:0;text-align:center">P{priority}</div>'
+                          # Plan dots
+                          f'<div style="display:flex;gap:2px;flex-shrink:0">{slots_html}</div>'
+                          # Badge
+                          f'<div style="flex-shrink:0"><span class="badge {badge_cls}" '
+                          f'style="font-size:0.55rem;padding:0.15rem 0.45rem">{badge_html}</span></div>'
                         f'</div>'
                     )
                 except Exception as e:
