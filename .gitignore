@@ -1,0 +1,33 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Logs
+*.log
+deploy.log
+ev_fleet.log
+dashboard/dashboard.log
+producers/cars.log
+producers/energy.log
+
+# Mac OS
+.DS_Store
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDEs
+.idea/
+.vscode/
+
+# Flink / Java (if any logs or temporary files get generated locally)
+target/
+*.jar
+!flink-sql-connector-kafka-1.17.0.jar

@@ -1,162 +1,153 @@
-import time
+"""
+Dynamic Bidding Price Producer
+================================
+Replaces the day-ahead CSV price streamer with a real-time occupancy-based
+price broadcaster.
+
+Every tick this producer:
+  1. Counts how many chargers are currently active (from Flink's commands).
+  2. Computes the current dynamic price using the formula:
+       price = BASE_PRICE * (1 + PRICE_COEFFICIENT * active / total)
+  3. Publishes the result to the 'energy_data' Kafka topic so Flink can
+     use it in the per-tick charging decision.
+
+Price examples (BASE=50, COEFF=1.5, TOTAL=5):
+  0/5 active → 50.0 EUR/MWh   (baseline)
+  1/5 active → 65.0 EUR/MWh
+  2/5 active → 80.0 EUR/MWh
+  3/5 active → 95.0 EUR/MWh
+  4/5 active → 110.0 EUR/MWh
+  5/5 active → 125.0 EUR/MWh  (2.5× baseline, full occupancy)
+"""
+
 import json
-import pandas as pd
+import time
+import threading
 import os
 import sys
 from kafka import KafkaProducer, KafkaConsumer
-import sys
-# producers/ -> go up one level to project root
+
+# Add project root to path for ev_logger import
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 try:
     from ev_logger import log
     _log = lambda msg: log('ENERGY_PROD', msg)
-except Exception as e:
+except Exception:
     _log = lambda msg: print(f'[ENERGY_PROD] {msg}')
 
-# Configuration
-BOOTSTRAP_SERVERS = os.environ.get('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092')
-TOPIC_NAME = 'energy_data'
-TOPIC_COMMANDS = 'charging_commands'
+# ---------------------------------------------------------------------------
+# Configuration — keep in sync with heuristic_scheduler.py constants
+# ---------------------------------------------------------------------------
+BOOTSTRAP_SERVERS    = os.environ.get('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092')
+TOPIC_ENERGY         = 'energy_data'
+TOPIC_COMMANDS       = 'charging_commands'
 
-# --- ROBUST PATH FIX ---
-# This ensures we find the file whether you run from 'root' or 'producers/'
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CSV_FILE_PATH = os.path.join(SCRIPT_DIR, '../data/Austria_Energy_Reports.csv')
+UPDATE_INTERVAL      = 1.25    # seconds per tick (matches car producer)
+TOTAL_CHARGERS       = 5       # must match STATION_CAPACITY in scheduler
+BASE_PRICE           = 50.0    # EUR/MWh at 0 occupancy
+PRICE_COEFFICIENT    = 1.5     # price multiplier slope (see formula above)
 
-# Time settings: 1 real second = 12 sim minutes → full sim day = 120 real seconds
-# 13:00 = interval 52 (52 × 15 sim-min = 780 sim-min = 13h)
-# NOTE: Flink's processing timer on ARM64 Docker fires at ~1.77s/interval (not 1.25s),
-# so one sim day = 96 × 1.77 ≈ 170 real seconds. Measured from log:
-#   batch@13:00 → midnight = 78s / 44 intervals = 1.77s/interval.
-INTERVAL_IDX_1300    = 52     # sim interval index for 13:00
-SECS_PER_INTERVAL    = 1.786  # measured: 50s extra → 28 interval shift → 1.786s/interval
-INTERVAL_SECONDS     = 159    # 120s→7:00, 170s→14:00, 163s→13:30, fine-tuned -4s→13:00
-FALLBACK_DELAY       = 5      # fallback if Flink idx can't be read
+# ---------------------------------------------------------------------------
+# Shared state — updated by the command-consumer thread
+# ---------------------------------------------------------------------------
+active_chargers      = 0        # count of currently charging cars
+active_chargers_lock = threading.Lock()
+active_car_ids: set  = set()    # which car_ids are actively charging
+
+sim_time_idx         = 48       # default to 12:00
+sim_time_lock        = threading.Lock()
 
 
-def get_flink_interval_idx():
+def compute_price(active: int, total: int = TOTAL_CHARGERS) -> float:
+    """Dynamic price based on charger occupancy."""
+    occupancy_ratio = active / max(total, 1)
+    return BASE_PRICE * (1.0 + PRICE_COEFFICIENT * occupancy_ratio)
+
+
+def consume_commands():
     """
-    Read the FIRST charging_command from Flink (earliest offset) to find the
-    starting sim interval index. Used only at startup, when the topic is fresh.
-    Returns the interval_idx or None on failure.
+    Background thread: listens to Flink's charging_commands topic and tracks
+    how many real (non-test) cars are currently in START_CHARGING state.
+    This count is used to compute the dynamic price each tick.
     """
-    try:
-        consumer = KafkaConsumer(
-            TOPIC_COMMANDS,
-            bootstrap_servers=BOOTSTRAP_SERVERS,
-            value_deserializer=lambda x: json.loads(x.decode('utf-8')),
-            auto_offset_reset='earliest',
-            enable_auto_commit=False,
-            group_id=f'energy_sync_{int(time.time())}',
-            consumer_timeout_ms=30000,
-        )
-        for msg in consumer:
-            idx = msg.value.get('interval_idx')
-            if idx is not None:
-                consumer.close()
-                return idx
-        consumer.close()
-    except Exception as e:
-        print(f"  Could not read Flink idx: {e}")
-    return None
+    global active_chargers, active_car_ids, sim_time_idx
 
+    consumer = KafkaConsumer(
+        TOPIC_COMMANDS,
+        bootstrap_servers=BOOTSTRAP_SERVERS,
+        group_id='energy_producer_occupancy',
+        value_deserializer=lambda x: json.loads(x.decode('utf-8')),
+        auto_offset_reset='latest',
+    )
+    _log('Command consumer started — tracking charger occupancy')
 
-def create_producer():
-    try:
-        producer = KafkaProducer(
-            bootstrap_servers=BOOTSTRAP_SERVERS,
-            value_serializer=lambda v: json.dumps(v).encode('utf-8')
-        )
-        print(f" Connected to Kafka at {BOOTSTRAP_SERVERS}")
-        return producer
-    except Exception as e:
-        print(f" Failed to connect to Kafka: {e}")
-        sys.exit(1)
+    for message in consumer:
+        cmd     = message.value
+        car_id  = cmd.get('car_id', '')
+        action  = cmd.get('action', '')
 
+        # Extract interval_idx from Flink commands to sync time
+        with sim_time_lock:
+            if 'interval_idx' in cmd and cmd['interval_idx'] is not None:
+                sim_time_idx = cmd['interval_idx']
 
-def send_batch(producer, df, start_index, label="TOMORROW"):
-    total_rows = len(df)
-    end_index = start_index + 96
+        # Only count real cars (ignore _test cars in the occupancy tally)
+        if car_id.endswith('_test'):
+            continue
 
-    if end_index <= total_rows:
-        batch = df.iloc[start_index:end_index]
-    else:
-        remaining = total_rows - start_index
-        batch_part1 = df.iloc[start_index:total_rows]
-        batch_part2 = df.iloc[0: (96 - remaining)]
-        batch = pd.concat([batch_part1, batch_part2])
-
-    print(f" Sending 96 prices for {label}...")
-    prices_sent = []
-    for _, row in batch.iterrows():
-        record = row.to_dict()
-        record['sent_at'] = time.time()
-        record['type'] = label
-        producer.send(TOPIC_NAME, record)
-        prices_sent.append(record.get('AT_price_day_ahead', 0))
-
-    producer.flush()
-    _log(f"BATCH_SENT | label={label} | count={len(prices_sent)} | min={min(prices_sent):.1f} | max={max(prices_sent):.1f} | avg={sum(prices_sent)/len(prices_sent):.1f} | start_idx={start_index}")
-    return end_index % total_rows
+        with active_chargers_lock:
+            if action == 'START_CHARGING':
+                active_car_ids.add(car_id)
+            elif action == 'STOP_CHARGING':
+                active_car_ids.discard(car_id)
+            active_chargers = len(active_car_ids)
 
 
 def main():
-    print(" Energy Market Simulator Starting...")
-    print(f" Looking for data at: {os.path.abspath(CSV_FILE_PATH)}")
+    print('Dynamic Bidding Price Producer Starting...')
+    print(f'  BASE_PRICE={BASE_PRICE} EUR/MWh | COEFFICIENT={PRICE_COEFFICIENT} | CHARGERS={TOTAL_CHARGERS}')
 
-    try:
-        df = pd.read_csv(CSV_FILE_PATH, sep=';')
-        print(f" Loaded CSV with {len(df)} rows.")
-        if 'AT_price_day_ahead' not in df.columns:
-            print(" ERROR: Column 'AT_price_day_ahead' not found in CSV!")
-            print(f"Found columns: {df.columns.tolist()}")
-            return
-    except FileNotFoundError:
-        print(f" CRITICAL ERROR: File not found at {CSV_FILE_PATH}")
-        print("Please check that 'data/Austria_Energy_Reports.csv' exists.")
-        return
+    # Start the occupancy-tracking consumer thread
+    t = threading.Thread(target=consume_commands, daemon=True)
+    t.start()
 
-    producer = create_producer()
-    current_index = 0
+    producer = KafkaProducer(
+        bootstrap_servers=BOOTSTRAP_SERVERS,
+        value_serializer=lambda v: json.dumps(v).encode('utf-8'),
+    )
+    _log(f'Connected to Kafka at {BOOTSTRAP_SERVERS}')
 
-    # --- Align with Flink's sim clock ---
-    # Instead of a fixed delay, read Flink's current interval_idx and compute
-    # exactly how many real seconds remain until sim 13:00 (idx=52).
-    # This guarantees the first batch arrives at 13:00 regardless of Docker startup time.
-    print(" Reading Flink's current sim clock from charging_commands...")
-    flink_idx = get_flink_interval_idx()
-
-    if flink_idx is not None:
-        # (52 - idx) % 96 gives intervals until next 13:00 (wraps to next day if past 13:00)
-        intervals_to_wait = (INTERVAL_IDX_1300 - flink_idx) % 96
-        wait_secs = intervals_to_wait * SECS_PER_INTERVAL
-        sim_now_h = (flink_idx * 15) // 60
-        sim_now_m = (flink_idx * 15) % 60
-        print(f"  Flink sim clock: {sim_now_h:02d}:{sim_now_m:02d} (idx={flink_idx})")
-        print(f"  Waiting {wait_secs:.1f}s ({intervals_to_wait} intervals) for 13:00 market clearing...")
-        _log(f"CLOCK_SYNC | flink_idx={flink_idx} | wait={wait_secs:.1f}s")
-        time.sleep(wait_secs)
-    else:
-        print(f"  Could not read Flink clock — using fallback {FALLBACK_DELAY}s delay")
-        time.sleep(FALLBACK_DELAY)
-
-    print("\n--- Market Cleared (13:00) — sending Tomorrow's Prices ---")
-    _log("MARKET_CLEAR 13:00 — sending TOMORROW")
-    current_index = send_batch(producer, df, current_index, label="TOMORROW")
-    _log(f"TOMORROW sent. next_index={current_index}")
-
+    tick = 0
     try:
         while True:
-            print(f" Waiting {INTERVAL_SECONDS}s for next Market Clearing (13:00)...")
-            time.sleep(INTERVAL_SECONDS)
+            with active_chargers_lock:
+                n_active = active_chargers
 
-            print("\n--- Market Cleared (13:00) ---")
-            _log(f"MARKET_CLEAR — sending new TOMORROW batch")
-            current_index = send_batch(producer, df, current_index, label="TOMORROW")
-            _log(f"TOMORROW sent. next_index={current_index}")
+            price = compute_price(n_active)
+            with sim_time_lock:
+                s_idx = sim_time_idx
+
+            record = {
+                'type':            'DYNAMIC_PRICE',
+                'active_chargers': n_active,
+                'total_chargers':  TOTAL_CHARGERS,
+                'base_price':      BASE_PRICE,
+                'current_price':   round(price, 4),
+                'timestamp':       time.time(),
+                'interval_idx':    s_idx,
+            }
+            producer.send(TOPIC_ENERGY, record)
+
+            if tick % 20 == 0:  # log every ~25s to avoid spam
+                _log(
+                    f'tick={tick} | active={n_active}/{TOTAL_CHARGERS} '
+                    f'| price={price:.2f} EUR/MWh'
+                )
+            tick += 1
+            time.sleep(UPDATE_INTERVAL)
 
     except KeyboardInterrupt:
-        print("Producer stopped.")
+        print('\\nEnergy producer stopped.')
     finally:
         producer.close()
 

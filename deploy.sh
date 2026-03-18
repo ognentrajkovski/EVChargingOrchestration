@@ -67,10 +67,8 @@ cd producers
 nohup python -u produce_car_data.py > cars.log 2>&1 &
 echo "  Car Producer started (PID $!)"
 
-# Start energy producer — it reads Flink's first charging_command to learn the
-# current sim interval_idx, then waits exactly the right number of seconds
-# until sim 13:00 before sending the first price batch.
-# No fixed delay here: alignment is handled inside produce_energy_data.py.
+# Start energy producer — it listens to Flink's charging commands to count
+# active chargers and broadcasts the real-time dynamic price every tick.
 nohup python -u produce_energy_data.py > energy.log 2>&1 &
 echo "  Energy Producer started (PID $!)"
 cd ..
