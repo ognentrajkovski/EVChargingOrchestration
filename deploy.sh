@@ -19,11 +19,11 @@ done
 echo "  JobManager is ready."
 
 echo "=== 2. Resetting Kafka Topics (delete + recreate to clear stale messages) ==="
-for TOPIC in energy_data cars_real charging_commands; do
+for TOPIC in energy_data cars_real charging_commands reservation_status; do
     $DOCKER_COMPOSE exec -T kafka kafka-topics --delete --topic $TOPIC --bootstrap-server localhost:9092 2>/dev/null || true
 done
 sleep 2
-for TOPIC in energy_data cars_real charging_commands; do
+for TOPIC in energy_data cars_real charging_commands reservation_status; do
     $DOCKER_COMPOSE exec -T kafka kafka-topics --create --topic $TOPIC --bootstrap-server localhost:9092 --partitions 1 --replication-factor 1
 done
 echo "  Topics reset."

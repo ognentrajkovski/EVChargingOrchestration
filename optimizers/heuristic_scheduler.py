@@ -1,9 +1,10 @@
 """
 Bidding-based EV Charging Decision Module
 ==========================================
-Replaces the 48-hour day-ahead price planner with a real-time, per-tick
-decision function. The charging cost is driven entirely by how many chargers
-are currently occupied (see produce_energy_data.py for the price formula).
+Real-time, per-tick charging decision function. The charging price is computed
+by produce_energy_data.py using a two-component algorithm:
+  60% instantaneous occupancy state (off-peak/normal/peak)
+  40% hourly profile (predictive, learned over time)
 
 Each car decides on every Flink tick whether to start or stop charging based
 on:
@@ -16,14 +17,8 @@ on:
 # ---------------------------------------------------------------------------
 STATION_CAPACITY = 5          # Total number of physical chargers
 
-# Baseline price (EUR/MWh) — matches producer's BASE_PRICE constant.
-# This is what you pay when zero chargers are occupied.
+# Baseline price (EUR/MWh) — normal-occupancy price from the energy producer.
 BASE_PRICE = 50.0
-
-# How aggressively price rises with occupancy (see price formula in producer).
-#   price = BASE_PRICE * (1 + PRICE_COEFFICIENT * active / total)
-# At full occupancy: price = BASE_PRICE * (1 + 1.5) = 2.5 × base
-PRICE_COEFFICIENT = 1.5
 
 MAX_POWER_PER_CHARGER = 11.0   # kW per charger
 CAR_BATTERY_CAPACITY_KWH = 60.0
@@ -39,10 +34,9 @@ EMERGENCY_SOC_THRESHOLD = 0.15
 # Lower SOC → higher multiplier → more willing to pay.
 _SOC_BANDS = [
     # (soc_upper_bound, acceptable_price_multiplier)
-    (0.30, 2.00),   # 15–30%  very low  — will pay up to 2.0× base (3 chargers busy)
-    (0.50, 1.60),   # 30–50%  low       — will pay up to 1.6× base (2 chargers busy)
-    (0.80, 1.20),   # 50–80%  medium    — will pay up to 1.2× base (0 chargers busy, requires empty station to start)
-    (1.01, 1.05),   # ≥ 80%   high      — opportunistic, up to 1.05× base (0 chargers busy)
+    (0.30, 2.50),   # 15–30%  very low  — will pay up to 2.5× base
+    (0.50, 1.80),   # 30–50%  low       — will pay up to 1.8× base
+    (1.01, 0.00),   # ≥ 50%   — never charge opportunistically (threshold=0, always fails price check)
 ]
 
 

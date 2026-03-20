@@ -1,18 +1,22 @@
 """
-EV Fleet Bidding Orchestrator (Flink)
-======================================
-Replaces the day-ahead price / overnight scheduling pipeline with a
-real-time bidding loop:
+EV Fleet Bidding Orchestrator (Flink) — with Reservation System
+================================================================
+Two-phase per-tick processing:
 
-  • On each 1.25 s tick the Flink timer fires for every car and calls
-    decide_charge(car, current_price).
-  • current_price is updated whenever a DYNAMIC_PRICE message arrives
-    from the energy producer (produced every tick, driven by occupancy).
-  • active_chargers_count is maintained in Flink state and used by the
-    producer to compute the next price (feedback loop).
-  • Emergency override (SOC < 15%) always grants a charger slot,
-    bypassing the price check — identical safety behaviour to before.
-  • Test-car (naive) logic is preserved unchanged for baseline comparison.
+  Phase 1 — Planning: each real car reserves the cheapest future slots.
+            Cars are processed lowest-SOC-first so urgent cars get first pick.
+            Reservation board tracks per-slot counts so subsequent cars see
+            updated projected prices.
+
+  Phase 2 — Execution: allocate chargers by priority:
+            1. Emergency (SOC < 15%) — always charge
+            2. Reserved  — cars with a reservation for this slot
+            3. Opportunistic — heuristic fallback (decide_charge)
+            4. Test cars — unchanged naive logic
+
+  After execution, a RESERVATION_STATUS message is emitted on the same
+  charging_commands sink so the energy producer and dashboard can show
+  projected prices.
 """
 
 import json
@@ -36,6 +40,12 @@ from pyflink.common import WatermarkStrategy
 
 # Import the bidding decision module
 from heuristic_scheduler import decide_charge, STATION_CAPACITY, BASE_PRICE, MAX_POWER_PER_CHARGER
+
+# Import reservation scheduler
+from reservation_scheduler import (
+    should_replan, select_cheapest_slots, slots_needed, projected_price,
+    SLOTS_PER_DAY,
+)
 
 import sys, os
 try:
@@ -64,10 +74,8 @@ class EVFleetProcessor(KeyedProcessFunction):
             MapStateDescriptor("cars", Types.STRING(), Types.STRING()))
 
         # --- Bidding state ---
-        # Current dynamic price received from the energy producer
         self.current_price_state = runtime_context.get_state(
             ValueStateDescriptor("current_price", Types.FLOAT()))
-        # Count of real cars currently charging (used only for logging / sanity)
         self.active_chargers_state = runtime_context.get_state(
             ValueStateDescriptor("active_chargers", Types.INT()))
 
@@ -85,16 +93,20 @@ class EVFleetProcessor(KeyedProcessFunction):
         self.was_charging = runtime_context.get_map_state(
             MapStateDescriptor("was_charging", Types.STRING(), Types.BOOLEAN()))
 
-        # --- Test-car naive-charging state ---
-        self.test_charging_state = runtime_context.get_map_state(
-            MapStateDescriptor("test_charging", Types.STRING(), Types.BOOLEAN()))
+        # --- Reservation state ---
+        # key: str(slot_idx) → value: JSON list of car_ids
+        self.reservation_board = runtime_context.get_map_state(
+            MapStateDescriptor("reservation_board", Types.STRING(), Types.STRING()))
+
+        # key: car_id → value: JSON {"reserved_slots": [...], "planned_soc": float, "planned_at_idx": int}
+        self.car_reservations = runtime_context.get_map_state(
+            MapStateDescriptor("car_reservations", Types.STRING(), Types.STRING()))
 
     # -----------------------------------------------------------------------
     def process_element(self, value, ctx: KeyedProcessFunction.Context):
         event_type, data = value
 
         if event_type == 'PRICE':
-            # Dynamic price update from the energy producer
             price = data.get('current_price')
             if price is not None:
                 self.current_price_state.update(float(price))
@@ -111,7 +123,6 @@ class EVFleetProcessor(KeyedProcessFunction):
                 existing = json.loads(existing_str)
                 flink_owns = existing.get('flink_managed', False)
                 if flink_owns:
-                    # Flink owns SOC — only update non-battery fields from sensor
                     existing['priority']  = data.get('priority', existing['priority'])
                     existing['plugged_in'] = data.get('plugged_in', False)
                     self.car_state.put(car_id, json.dumps(existing))
@@ -129,16 +140,64 @@ class EVFleetProcessor(KeyedProcessFunction):
             self.timer_set_state.update(True)
 
     # -----------------------------------------------------------------------
+    # Helper: load reservation_counts dict from reservation_board state
+    # -----------------------------------------------------------------------
+    def _load_reservation_counts(self):
+        """Return {slot_idx(int): count(int)} from the reservation board."""
+        counts = {}
+        for slot_key in self.reservation_board.keys():
+            car_list_json = self.reservation_board.get(slot_key)
+            if car_list_json:
+                car_list = json.loads(car_list_json)
+                counts[int(slot_key)] = len(car_list)
+        return counts
+
+    def _remove_car_from_board(self, car_id, slots):
+        """Remove car_id from the given slots on the reservation board."""
+        for slot in slots:
+            slot_key = str(slot)
+            car_list_json = self.reservation_board.get(slot_key)
+            if car_list_json:
+                car_list = json.loads(car_list_json)
+                if car_id in car_list:
+                    car_list.remove(car_id)
+                if car_list:
+                    self.reservation_board.put(slot_key, json.dumps(car_list))
+                else:
+                    self.reservation_board.remove(slot_key)
+
+    def _add_car_to_board(self, car_id, slots):
+        """Add car_id to the given slots on the reservation board."""
+        for slot in slots:
+            slot_key = str(slot)
+            car_list_json = self.reservation_board.get(slot_key)
+            if car_list_json:
+                car_list = json.loads(car_list_json)
+            else:
+                car_list = []
+            if car_id not in car_list:
+                car_list.append(car_id)
+            self.reservation_board.put(slot_key, json.dumps(car_list))
+
+    # -----------------------------------------------------------------------
     def on_timer(self, timestamp, ctx: KeyedProcessFunction.OnTimerContext):
         idx = self.interval_state.value()
         if idx is None:
             idx = 0
 
-        # Midnight roll-over: advance day_of_week (0=Mon … 6=Sun)
+        # Midnight roll-over: advance day_of_week, clear reservations
         if idx >= 96:
             dow = (self.day_of_week_state.value() or 0) + 1
             self.day_of_week_state.update(dow % 7)
             log('SYSTEM', f'MIDNIGHT — day_of_week now {dow % 7}')
+
+            # Clear reservation state
+            for slot_key in list(self.reservation_board.keys()):
+                self.reservation_board.remove(slot_key)
+            for car_id in list(self.car_reservations.keys()):
+                self.car_reservations.remove(car_id)
+            log('RESERVATION', 'Midnight reset — cleared all reservations')
+
             idx = 0
 
         self.interval_state.update(idx + 1)
@@ -151,113 +210,208 @@ class EVFleetProcessor(KeyedProcessFunction):
 
         car_ids = list(self.car_state.keys())
 
-        # Extract cars and shuffle/sort by SOC to prevent alphabetical map-key bias
-        # meaning lowest battery cars naturally get evaluated first for slots
+        # Extract cars and shuffle/sort by SOC (lowest first)
         car_list = []
         for cid in car_ids:
             cdr = self.car_state.get(cid)
             if cdr:
                 car_list.append((cid, json.loads(cdr)))
-                
+
         import random
         random.shuffle(car_list)
         car_list.sort(key=lambda x: x[1].get('current_soc', 1.0))
 
-        # Re-calculate active chargers from scratch based on strict priority allocation
-        total_busy = 0
-        new_test_active = 0
-        new_real_active = 0
+        # ===================================================================
+        # PHASE 1 — PLANNING: Update reservations for cars
+        # ===================================================================
+        for car_id, car_data in car_list:
+            current_soc = car_data.get('current_soc', 1.0)
+            is_emergency = current_soc < 0.15
+
+            # Load existing reservation for this car
+            res_json = self.car_reservations.get(car_id)
+            car_res = json.loads(res_json) if res_json else None
+
+            if not should_replan(car_res, idx, current_soc):
+                continue
+
+            # Remove car from old slots on the board
+            if car_res and car_res.get('reserved_slots'):
+                self._remove_car_from_board(car_id, car_res['reserved_slots'])
+
+            # How many slots does this car need?
+            num_needed = slots_needed(current_soc)
+            if num_needed <= 0:
+                # Car is at or above target — clear reservation
+                self.car_reservations.remove(car_id)
+                continue
+
+            # Build reservation counts from the board (reflects all other cars' reservations)
+            reservation_counts = self._load_reservation_counts()
+
+            # Select cheapest slots
+            chosen_slots = select_cheapest_slots(idx, num_needed, reservation_counts, is_emergency)
+
+            if not chosen_slots:
+                self.car_reservations.remove(car_id)
+                continue
+
+            # Update the board and car reservations
+            self._add_car_to_board(car_id, chosen_slots)
+            new_res = {
+                'reserved_slots': chosen_slots,
+                'planned_soc': current_soc,
+                'planned_at_idx': idx,
+            }
+            self.car_reservations.put(car_id, json.dumps(new_res))
+            log('RESERVATION', f'{car_id} | soc={current_soc*100:.1f}% | slots={chosen_slots}')
+
+        # ===================================================================
+        # PHASE 2 — EXECUTION: Allocate chargers by priority
+        # ===================================================================
+        # Build set of car_ids that have a reservation for this slot
+        slot_key = str(idx)
+        reserved_this_slot_json = self.reservation_board.get(slot_key)
+        reserved_this_slot = set(json.loads(reserved_this_slot_json)) if reserved_this_slot_json else set()
+
+        # Categorize cars into priority buckets
+        emergency_cars = []
+        reserved_cars = []
+        opportunistic_cars = []
 
         for car_id, car_data in car_list:
             current_soc = car_data.get('current_soc', 1.0)
-            target_power = 0.0
-            reason_str = ""
+            is_emergency = current_soc < 0.15
+            recovering = car_data.get('emergency_charging', False) and current_soc < 0.40
 
-            if car_id.endswith('_test'):
-                # --- NAIVE TEST-CAR LOGIC ---
-                test_active = self.test_charging_state.get(car_id) or False
-                wants_charge = False
-
-                if current_soc <= 0.02:
-                    wants_charge = True
-                elif current_soc >= 0.99:
-                    wants_charge = False
-                else:
-                    wants_charge = test_active
-
-                should_charge = wants_charge and (total_busy < STATION_CAPACITY)
-
-                if should_charge:
-                    total_busy += 1
-                    new_test_active += 1
-                    target_power = MAX_POWER_PER_CHARGER
-                    
-                self.test_charging_state.put(car_id, should_charge)
-                reason_str = "charging" if should_charge else ("station full" if wants_charge else "idle")
-
+            if is_emergency or recovering:
+                emergency_cars.append((car_id, car_data))
+            elif car_id in reserved_this_slot:
+                reserved_cars.append((car_id, car_data))
             else:
-                # --- REAL CAR: bidding decision ---
+                # Check heuristic fallback
                 prev_charging = self.was_charging.get(car_id) or False
-                emergency     = current_soc < 0.15
-                recovering    = car_data.get('emergency_charging', False) and current_soc < 0.40
+                if decide_charge(car_data, current_price, prev_charging):
+                    opportunistic_cars.append((car_id, car_data))
+                else:
+                    opportunistic_cars.append((car_id, car_data))  # still in list for command generation
 
-                # Determine if car *would* charge if there was space
-                car_wants_to_charge = decide_charge(car_data, current_price, prev_charging)
-                if emergency or recovering:
-                    car_wants_to_charge = True
+        # Build the priority-ordered charging queue
+        # Emergency → Reserved → Opportunistic (only those that want to charge)
+        total_busy = 0
+        new_real_active = 0
 
-                should_charge = car_wants_to_charge and (total_busy < STATION_CAPACITY)
+        # Track which cars get to charge and their reasons
+        charge_decisions = {}  # car_id → (should_charge, reason_str, car_data)
 
+        # 1. Emergency cars — always charge
+        for car_id, car_data in emergency_cars:
+            current_soc = car_data.get('current_soc', 1.0)
+            if current_soc >= 0.99:
+                charge_decisions[car_id] = (False, "full", car_data)
+                continue
+            should_charge = total_busy < STATION_CAPACITY
+            if should_charge:
+                total_busy += 1
+                new_real_active += 1
+                car_data['emergency_charging'] = True
+                charge_decisions[car_id] = (True, "emergency", car_data)
+                log('FLINK', f'{car_id} | EMERGENCY | soc={current_soc*100:.1f}% | price={current_price:.2f}')
+            else:
+                car_data['emergency_charging'] = False
+                charge_decisions[car_id] = (False, "station full", car_data)
+                log('FLINK', f'{car_id} | EMERGENCY DEFERRED (station full) | soc={current_soc*100:.1f}%')
+
+        # 2. Reserved cars — have a reservation for this slot
+        for car_id, car_data in reserved_cars:
+            current_soc = car_data.get('current_soc', 1.0)
+            if current_soc >= 0.99:
+                charge_decisions[car_id] = (False, "full", car_data)
+                continue
+            should_charge = total_busy < STATION_CAPACITY
+            if should_charge:
+                total_busy += 1
+                new_real_active += 1
+                car_data['emergency_charging'] = False
+                charge_decisions[car_id] = (True, "reserved", car_data)
+                log('FLINK', f'{car_id} | RESERVED CHARGING | soc={current_soc*100:.1f}% | price={current_price:.2f}')
+            else:
+                car_data['emergency_charging'] = False
+                charge_decisions[car_id] = (False, "station full", car_data)
+                log('FLINK', f'{car_id} | RESERVED DEFERRED (station full) | soc={current_soc*100:.1f}%')
+
+        # 3. Opportunistic real cars — heuristic fallback
+        for car_id, car_data in opportunistic_cars:
+            if car_id in charge_decisions:
+                continue  # already handled as emergency or reserved
+            current_soc = car_data.get('current_soc', 1.0)
+            prev_charging = self.was_charging.get(car_id) or False
+            car_wants_to_charge = decide_charge(car_data, current_price, prev_charging)
+
+            if current_soc >= 0.99:
+                charge_decisions[car_id] = (False, "full", car_data)
+                continue
+
+            if car_wants_to_charge:
+                should_charge = total_busy < STATION_CAPACITY
                 if should_charge:
                     total_busy += 1
                     new_real_active += 1
-                    target_power = MAX_POWER_PER_CHARGER
-
-                    if emergency or recovering:
-                        car_data['emergency_charging'] = True
-                        reason_str = "emergency"
-                        log('FLINK', f'{car_id} | EMERGENCY | soc={current_soc*100:.1f}% | price={current_price:.2f}')
-                    else:
-                        car_data['emergency_charging'] = False
-                        reason_str = "charging"
-                        log('FLINK', f'{car_id} | CHARGING | soc={current_soc*100:.1f}% | price={current_price:.2f}')
+                    car_data['emergency_charging'] = False
+                    charge_decisions[car_id] = (True, "opportunistic", car_data)
+                    log('FLINK', f'{car_id} | OPPORTUNISTIC CHARGING | soc={current_soc*100:.1f}% | price={current_price:.2f}')
                 else:
                     car_data['emergency_charging'] = False
-                    if car_wants_to_charge:
-                        reason_str = "station full"
-                        pre = "EMERGENCY " if (emergency or recovering) else ""
-                        log('FLINK', f'{car_id} | {pre}DEFERRED (station full) | soc={current_soc*100:.1f}% | price={current_price:.2f}')
-                    else:
-                        reason_str = "price too high"
-                        log('FLINK', f'{car_id} | DEFERRED (price) | soc={current_soc*100:.1f}% | price={current_price:.2f}')
+                    charge_decisions[car_id] = (False, "station full", car_data)
+            else:
+                car_data['emergency_charging'] = False
+                charge_decisions[car_id] = (False, "price too high", car_data)
+
+        # Handle any cars not yet in charge_decisions (shouldn't happen, but guard)
+        for car_id, car_data in car_list:
+            if car_id not in charge_decisions:
+                charge_decisions[car_id] = (False, "idle", car_data)
+
+        # ===================================================================
+        # YIELD COMMANDS for all cars
+        # ===================================================================
+        for car_id, car_data in car_list:
+            should_charge, reason_str, car_data = charge_decisions[car_id]
+            target_power = MAX_POWER_PER_CHARGER if should_charge else 0.0
 
             self.was_charging.put(car_id, should_charge)
 
-            # Build command
+            # Get reservation info for this car
+            has_reservation = car_id in reserved_this_slot
+            res_json = self.car_reservations.get(car_id)
+            car_reserved_slots = json.loads(res_json).get('reserved_slots', []) if res_json else []
+
             command = {
                 'car_id':         car_id,
                 'interval_idx':   idx,
-                'day_of_week':    day_of_week,   # 0=Mon … 6=Sun
+                'day_of_week':    day_of_week,
                 'action':         'START_CHARGING' if should_charge else 'STOP_CHARGING',
                 'reason':         reason_str,
                 'power_kw':       target_power,
                 'timestamp':      time.time(),
                 'charging_price': round(current_price, 4) if should_charge else None,
+                'reserved':       has_reservation,
+                'reserved_slots': car_reserved_slots,
             }
 
             if should_charge:
-                energy_added         = target_power * 0.25   # 15-sim-min = 0.25h
-                new_kwh              = min(60.0, car_data.get('current_battery_kwh', 60.0) + energy_added)
-                new_kwh              = max(new_kwh, car_data.get('current_battery_kwh', 60.0))
+                energy_added = target_power * 0.25  # 15-sim-min = 0.25h
+                new_kwh = min(60.0, car_data.get('current_battery_kwh', 60.0) + energy_added)
+                new_kwh = max(new_kwh, car_data.get('current_battery_kwh', 60.0))
                 car_data['current_battery_kwh'] = new_kwh
-                car_data['current_soc']         = new_kwh / 60.0
-                car_data['plugged_in']           = True
-                car_data['flink_managed']        = True
+                car_data['current_soc'] = new_kwh / 60.0
+                car_data['plugged_in'] = True
+                car_data['flink_managed'] = True
                 self.car_state.put(car_id, json.dumps(car_data))
                 command['new_soc'] = car_data['current_soc']
             else:
                 if car_data.get('plugged_in', False):
-                    car_data['plugged_in']    = False
+                    car_data['plugged_in'] = False
                     car_data['flink_managed'] = False
                     self.car_state.put(car_id, json.dumps(car_data))
                 real_soc = car_data.get('current_soc')
@@ -265,6 +419,24 @@ class EVFleetProcessor(KeyedProcessFunction):
 
             log_command(car_id, command['action'], command.get('new_soc'), idx)
             yield json.dumps(command)
+
+        # ===================================================================
+        # EMIT RESERVATION STATUS
+        # ===================================================================
+        reservation_counts = self._load_reservation_counts()
+        projected_prices = [
+            projected_price(reservation_counts.get(s, 0))
+            for s in range(SLOTS_PER_DAY)
+        ]
+        reservation_status = {
+            'type':               'RESERVATION_STATUS',
+            'car_id':             '__reservation_status__',
+            'interval_idx':       idx,
+            'reservation_counts': {str(k): v for k, v in reservation_counts.items()},
+            'projected_prices':   [round(p, 4) for p in projected_prices],
+            'timestamp':          time.time(),
+        }
+        yield json.dumps(reservation_status)
 
         # Persist updated real charger count
         self.active_chargers_state.update(new_real_active)
@@ -281,6 +453,7 @@ def main():
 
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     env.add_python_file(os.path.join(project_root, "optimizers", "heuristic_scheduler.py"))
+    env.add_python_file(os.path.join(project_root, "optimizers", "reservation_scheduler.py"))
     ev_logger_path = os.path.join(project_root, "ev_logger.py")
     if os.path.exists(ev_logger_path):
         env.add_python_file(ev_logger_path)
