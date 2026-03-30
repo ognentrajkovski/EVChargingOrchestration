@@ -28,7 +28,9 @@ import time
 import threading
 import os
 import sys
+import io
 from kafka import KafkaProducer, KafkaConsumer
+# sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
 # Add project root to path for ev_logger import
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -143,39 +145,47 @@ def consume_commands():
     global active_chargers, active_car_ids, sim_time_idx
     global projected_prices, reservation_counts
 
-    consumer = KafkaConsumer(
-        TOPIC_COMMANDS,
-        bootstrap_servers=BOOTSTRAP_SERVERS,
-        group_id='energy_producer_occupancy',
-        value_deserializer=lambda x: json.loads(x.decode('utf-8')),
-        auto_offset_reset='latest',
-    )
-    _log('Command consumer started — tracking charger occupancy')
+    _log('Command consumer thread started')
+    while True:
+        try:
+            consumer = KafkaConsumer(
+                TOPIC_COMMANDS,
+                bootstrap_servers=BOOTSTRAP_SERVERS,
+                group_id='energy_producer_occupancy',
+                value_deserializer=lambda x: json.loads(x.decode('utf-8')),
+                auto_offset_reset='latest',
+                reconnect_backoff_ms=1000,
+                reconnect_backoff_max_ms=5000
+            )
+            _log('Connected to command topic — tracking charger occupancy')
 
-    for message in consumer:
-        cmd     = message.value
+            for message in consumer:
+                cmd     = message.value
 
-        # Handle RESERVATION_STATUS messages from Flink
-        if cmd.get('type') == 'RESERVATION_STATUS':
-            with reservation_lock:
-                projected_prices = cmd.get('projected_prices', [])
-                reservation_counts = cmd.get('reservation_counts', {})
-            continue
+                # Handle RESERVATION_STATUS messages from Flink
+                if cmd.get('type') == 'RESERVATION_STATUS':
+                    with reservation_lock:
+                        projected_prices = cmd.get('projected_prices', [])
+                        reservation_counts = cmd.get('reservation_counts', {})
+                    continue
 
-        car_id  = cmd.get('car_id', '')
-        action  = cmd.get('action', '')
+                car_id  = cmd.get('car_id', '')
+                action  = cmd.get('action', '')
 
-        # Extract interval_idx from Flink commands to sync time
-        with sim_time_lock:
-            if 'interval_idx' in cmd and cmd['interval_idx'] is not None:
-                sim_time_idx = cmd['interval_idx']
+                # Extract interval_idx from Flink commands to sync time
+                with sim_time_lock:
+                    if 'interval_idx' in cmd and cmd['interval_idx'] is not None:
+                        sim_time_idx = cmd['interval_idx']
 
-        with active_chargers_lock:
-            if action == 'START_CHARGING':
-                active_car_ids.add(car_id)
-            elif action == 'STOP_CHARGING':
-                active_car_ids.discard(car_id)
-            active_chargers = len(active_car_ids)
+                with active_chargers_lock:
+                    if action == 'START_CHARGING':
+                        active_car_ids.add(car_id)
+                    elif action == 'STOP_CHARGING':
+                        active_car_ids.discard(car_id)
+                    active_chargers = len(active_car_ids)
+        except Exception as e:
+            _log(f'Consumer faced an error: {e}. Retrying in 5s...')
+            time.sleep(5)
 
 
 def main():
@@ -183,7 +193,7 @@ def main():
     print(f'  BASE_PRICE={BASE_PRICE} EUR/MWh | CHARGERS={TOTAL_CHARGERS} | WEIGHTS={INSTANT_WEIGHT:.0%} instant + {HISTORIC_WEIGHT:.0%} historic')
     _labels = ['off-peak', 'normal', 'peak']
     print(f'  PRICE STATES: ' + ' | '.join(
-        f'{_labels[i]} ×{m}→{BASE_PRICE*m:.0f}€' for i, (_, m) in enumerate(PRICE_LEVELS)
+        f'{_labels[i]} x{m} -> {BASE_PRICE*m:.0f} EUR' for i, (_, m) in enumerate(PRICE_LEVELS)
     ))
 
     # Start the occupancy-tracking consumer thread
@@ -252,7 +262,7 @@ def main():
                 _log(
                     f'tick={tick} | hour={hour:02d}:xx | active={n_active}/{TOTAL_CHARGERS} '
                     f'| state={state} | instant={instant_price:.1f} hist={hist_price:.1f} '
-                    f'→ final={price:.2f} EUR/MWh{boost_tag}'
+                    f' -> final={price:.2f} EUR/MWh{boost_tag}'
                 )
             tick += 1
             time.sleep(UPDATE_INTERVAL)

@@ -31,3 +31,7 @@ venv.bak/
 target/
 *.jar
 !flink-sql-connector-kafka-1.17.0.jar
+__pycache__/
+*.log
+*.log
+__pycache__/

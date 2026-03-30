@@ -3,6 +3,7 @@ version: '3.8'
 services:
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.0
+    platform: linux/amd64
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
     ports:
@@ -10,6 +11,7 @@ services:
 
   kafka:
     image: confluentinc/cp-kafka:7.5.0
+    platform: linux/amd64
     depends_on:
       - zookeeper
     ports:
@@ -21,8 +23,6 @@ services:
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_INTERNAL://0.0.0.0:29092
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT_INTERNAL
-      # Required for single-broker setup — Kafka defaults to replication factor 3
-      # which causes InvalidReplicationFactorException and breaks consumer groups entirely
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
@@ -31,27 +31,31 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: custom-pyflink-arm64:1.17.0
-    platform: linux/arm64
+    image: custom-pyflink-amd64:1.17.0
+    platform: linux/amd64
     ports:
       - "8081:8081"
     command: jobmanager
     volumes:
       - ..:/opt/flink/project
+      - ../flink-sql-connector-kafka-1.17.0.jar:/opt/flink/lib/flink-sql-connector-kafka-1.17.0.jar
     environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
       - |
         FLINK_PROPERTIES=
         jobmanager.rpc.address: flink-jobmanager
 
   flink-taskmanager:
-    image: custom-pyflink-arm64:1.17.0
-    platform: linux/arm64
+    image: custom-pyflink-amd64:1.17.0
+    platform: linux/amd64
     depends_on:
       - flink-jobmanager
     command: taskmanager
     volumes:
       - ..:/opt/flink/project
+      - ../flink-sql-connector-kafka-1.17.0.jar:/opt/flink/lib/flink-sql-connector-kafka-1.17.0.jar
     environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
       - |
         FLINK_PROPERTIES=
         jobmanager.rpc.address: flink-jobmanager

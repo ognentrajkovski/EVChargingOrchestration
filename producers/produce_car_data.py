@@ -93,44 +93,52 @@ def demand_multiplier(interval_idx: int, day_of_week: int) -> float:
 
 def consume_commands():
     """Background thread to listen for charging commands/updates from Flink."""
-    consumer = KafkaConsumer(
-        TOPIC_COMMANDS,
-        bootstrap_servers=BOOTSTRAP_SERVERS,
-        group_id='car_producer_feedback',
-        value_deserializer=lambda x: json.loads(x.decode('utf-8'))
-    )
-
     print("Command Consumer Started...")
-    for message in consumer:
-        cmd = message.value
-        car_id  = cmd.get('car_id')
-        action  = cmd.get('action')
-        new_soc = cmd.get('new_soc')
+    while True:
+        try:
+            consumer = KafkaConsumer(
+                TOPIC_COMMANDS,
+                bootstrap_servers=BOOTSTRAP_SERVERS,
+                group_id='car_producer_feedback',
+                value_deserializer=lambda x: json.loads(x.decode('utf-8')),
+                # Add some more robust settings
+                reconnect_backoff_ms=1000,
+                reconnect_backoff_max_ms=5000
+            )
 
-        # Update shared sim clock from Flink's command metadata
-        with sim_time_lock:
-            if cmd.get('interval_idx') is not None:
-                sim_time['interval_idx'] = cmd['interval_idx']
-            if cmd.get('day_of_week') is not None:
-                sim_time['day_of_week'] = cmd['day_of_week']
+            for message in consumer:
+                cmd = message.value
+                car_id  = cmd.get('car_id')
+                action  = cmd.get('action')
+                new_soc = cmd.get('new_soc')
 
-        with cars_lock:
-            if car_id in cars_map:
-                car = cars_map[car_id]
-                if action == 'START_CHARGING':
-                    log('CAR_PROD', f"{car_id} | START_CHARGING | new_soc={new_soc} | batt_before={car.battery_level:.1f}%")
-                    if new_soc is not None and (new_soc * 100.0) > car.battery_level:
-                        car.battery_level = new_soc * 100.0
-                    car.is_charging = True
-                    car.is_parked   = True
-                    log('CAR_PROD', f"{car_id} | after START | batt={car.battery_level:.1f}%")
-                elif action == 'STOP_CHARGING':
-                    log('CAR_PROD', f"{car_id} | STOP_CHARGING | new_soc={new_soc} | batt_before={car.battery_level:.1f}%")
-                    if new_soc is not None and (new_soc * 100.0) > car.battery_level:
-                        car.battery_level = new_soc * 100.0
-                    car.is_charging = False
-                    car.is_parked = False
-                    log('CAR_PROD', f"{car_id} | after STOP | batt={car.battery_level:.1f}% | driving")
+                # Update shared sim clock from Flink's command metadata
+                with sim_time_lock:
+                    if cmd.get('interval_idx') is not None:
+                        sim_time['interval_idx'] = cmd['interval_idx']
+                    if cmd.get('day_of_week') is not None:
+                        sim_time['day_of_week'] = cmd['day_of_week']
+
+                with cars_lock:
+                    if car_id in cars_map:
+                        car = cars_map[car_id]
+                        if action == 'START_CHARGING':
+                            log('CAR_PROD', f"{car_id} | START_CHARGING | new_soc={new_soc} | batt_before={car.battery_level:.1f}%")
+                            if new_soc is not None and (new_soc * 100.0) > car.battery_level:
+                                car.battery_level = new_soc * 100.0
+                            car.is_charging = True
+                            car.is_parked   = True
+                            log('CAR_PROD', f"{car_id} | after START | batt={car.battery_level:.1f}%")
+                        elif action == 'STOP_CHARGING':
+                            log('CAR_PROD', f"{car_id} | STOP_CHARGING | new_soc={new_soc} | batt_before={car.battery_level:.1f}%")
+                            if new_soc is not None and (new_soc * 100.0) > car.battery_level:
+                                car.battery_level = new_soc * 100.0
+                            car.is_charging = False
+                            car.is_parked = False
+                            log('CAR_PROD', f"{car_id} | after STOP | batt={car.battery_level:.1f}% | driving")
+        except Exception as e:
+            log_error('CONSUME_ERROR', f"Consumer faced an error: {e}. Retrying in 5s...")
+            time.sleep(5)
 
 def main():
     print(f"Starting Car Producer with Delegation Logic...")
