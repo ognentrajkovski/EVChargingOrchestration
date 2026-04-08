@@ -19,11 +19,11 @@ done
 echo "  JobManager is ready."
 
 echo "=== 2. Resetting Kafka Topics (delete + recreate to clear stale messages) ==="
-for TOPIC in energy_data cars_real charging_commands; do
+for TOPIC in energy_data cars_real charging_commands reservation_status; do
     $DOCKER_COMPOSE exec -T kafka kafka-topics --delete --topic $TOPIC --bootstrap-server localhost:9092 2>/dev/null || true
 done
 sleep 2
-for TOPIC in energy_data cars_real charging_commands; do
+for TOPIC in energy_data cars_real charging_commands reservation_status; do
     $DOCKER_COMPOSE exec -T kafka kafka-topics --create --topic $TOPIC --bootstrap-server localhost:9092 --partitions 1 --replication-factor 1
 done
 echo "  Topics reset."
@@ -64,14 +64,12 @@ sleep 1
 
 cd producers
 # Start car producer so Flink has input and begins firing timer ticks
-nohup python -u produce_car_data.py > cars.log 2>&1 &
+nohup python3 -u produce_car_data.py > cars.log 2>&1 &
 echo "  Car Producer started (PID $!)"
 
-# Start energy producer — it reads Flink's first charging_command to learn the
-# current sim interval_idx, then waits exactly the right number of seconds
-# until sim 13:00 before sending the first price batch.
-# No fixed delay here: alignment is handled inside produce_energy_data.py.
-nohup python -u produce_energy_data.py > energy.log 2>&1 &
+# Start energy producer — it listens to Flink's charging commands to count
+# active chargers and broadcasts the real-time dynamic price every tick.
+nohup python3 -u produce_energy_data.py > energy.log 2>&1 &
 echo "  Energy Producer started (PID $!)"
 cd ..
 echo "  All producers started. Logs: producers/cars.log, producers/energy.log"

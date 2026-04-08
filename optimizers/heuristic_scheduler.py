@@ -1,161 +1,93 @@
-import json
-import random
-import time
-import numpy as np
+"""
+Bidding-based EV Charging Decision Module
+==========================================
+Real-time, per-tick charging decision function. The charging price is computed
+by produce_energy_data.py using a two-component algorithm:
+  60% instantaneous occupancy state (off-peak/normal/peak)
+  40% hourly profile (predictive, learned over time)
 
+Each car decides on every Flink tick whether to start or stop charging based
+on:
+  1. Battery level (SOC) — below EMERGENCY_SOC_THRESHOLD, always charge.
+  2. Acceptable price band — per-SOC multiplier applied to BASE_PRICE.
+"""
+
+# ---------------------------------------------------------------------------
 # Simulation Constants
-SIMULATION_INTERVAL_MINS = 15
-TOTAL_INTERVALS = 96
-STATION_CAPACITY = 5
-MAX_POWER_PER_CHARGER = 11.0  # kW
+# ---------------------------------------------------------------------------
+STATION_CAPACITY = 5          # Total number of physical chargers
+
+# Baseline price (EUR/MWh) — normal-occupancy price from the energy producer.
+BASE_PRICE = 50.0
+
+MAX_POWER_PER_CHARGER = 11.0   # kW per charger
 CAR_BATTERY_CAPACITY_KWH = 60.0
 
-# Thresholds
-MIN_SOC_EMERGENCY = 0.15
+# ---------------------------------------------------------------------------
+# SOC Thresholds & Acceptable Price Bands
+# ---------------------------------------------------------------------------
+# Emergency: car always charges regardless of price
+EMERGENCY_SOC_THRESHOLD = 0.15
 
-# CHANGED: Allow single 15-min blocks to prevent fragmentation issues
-MIN_DURATION_BLOCKS = 1
-MAX_SESSIONS_PER_DAY = 3
+# For each SOC band the car will charge only if current_price <=
+# BASE_PRICE * ACCEPTABLE_MULTIPLIER[band].
+# Lower SOC → higher multiplier → more willing to pay.
+_SOC_BANDS = [
+    # (soc_upper_bound, acceptable_price_multiplier)
+    (0.30, 2.50),   # 15–30%  very low  — will pay up to 2.5× base
+    (0.50, 1.80),   # 30–50%  low       — will pay up to 1.8× base
+    (1.01, 0.00),   # ≥ 50%   — never charge opportunistically (threshold=0, always fails price check)
+]
 
 
-def smart_heuristic_schedule(prices, cars, current_idx=0, sessions_used=None, station_capacity=None):
-    # Input validation
-    if not prices:
-        return {c['id']: [] for c in cars if c.get('id')}
-    prices = [p if (p is not None and not np.isnan(float(p)) and float(p) >= 0) else 999.0 for p in prices]
-    cars = [c for c in cars if c.get('id') and c.get('current_soc') is not None and c.get('current_battery_kwh') is not None]
-    if not cars:
-        return {}
+def acceptable_price(soc: float, is_charging: bool = False) -> float:
+    """
+    Return the maximum price (EUR/MWh) this car is willing to pay at the
+    given state-of-charge.  Below EMERGENCY_SOC_THRESHOLD the car will charge
+    regardless, so this value is only consulted for non-emergency decisions.
+    
+    Hysteresis is applied if the car is already charging to prevent rapid 
+    plug/unplug ping-ponging when its own charging triggers a price spike.
+    """
+    base_multiplier = 0.50
+    for upper, multiplier in _SOC_BANDS:
+        if soc < upper:
+            base_multiplier = multiplier
+            break
+            
+    # Hysteresis bonus: if we already hold a slot, we are willing to pay 
+    # +0.6x base price more to keep it, so we don't bounce out instantly
+    if is_charging:
+        base_multiplier += 0.60
+        
+    return BASE_PRICE * base_multiplier
 
-    total_intervals = len(prices)
-    # print(f"Running Smart Heuristic for {len(cars)} cars at interval {current_idx}...")
-    start_time = time.time()
 
-    # 1. Analyze Prices
-    avg_price = np.mean(prices)
-    very_low_price_threshold = np.percentile(prices, 10)  # Bottom 10%
+def decide_charge(car: dict, current_price: float, is_charging: bool = False) -> bool:
+    """
+    Real-time bidding decision for a single car.
 
-    # 2. Sort Cars by Priority (Descending) & Urgency (Low SOC first)
-    cars.sort(key=lambda x: (x['priority'], -x['current_soc']), reverse=True)
+    Parameters
+    ----------
+    car           : car state dict, must contain 'current_soc' (0.0 – 1.0)
+    current_price : current dynamic charging price in EUR/MWh
+    is_charging   : whether the car is already actively charging this tick
 
-    # 3. Initialize Schedule & Tracking
-    _capacity = station_capacity if station_capacity and station_capacity > 0 else STATION_CAPACITY
-    schedule = {c['id']: [] for c in cars}
-    station_load = [0] * total_intervals
-    _used = sessions_used or {}
-    car_sessions = {c['id']: _used.get(c['id'], 0) for c in cars}
+    Returns
+    -------
+    True  → car should start / continue charging this tick
+    False → car should stop / remain idle this tick
+    """
+    soc = car.get('current_soc', 1.0)
 
-    # 4. Allocation Loop
-    for car in cars:
-        current_kwh = car['current_battery_kwh']
-        current_soc = car['current_soc']
-        departure = total_intervals
+    # --- Full Battery Override ---
+    if soc >= 0.99:
+        return False  # Fully charged, must yield charger
 
-        # Determine Strategy
-        target_soc = 0.0
-        price_limit = 999999.0
-        min_blocks_needed = MIN_DURATION_BLOCKS
+    # --- Safety override ---
+    if soc < EMERGENCY_SOC_THRESHOLD:
+        return True  # charge at any price
 
-        # Emergency (< 15%) — charge at any price
-        if current_soc < 0.15:
-            target_soc = 0.40
-            price_limit = 999999.0
-            min_blocks_needed = 1
-
-        # Low (15% - 40%) — charge at average price or below
-        elif current_soc < 0.40:
-            target_soc = 0.60
-            price_limit = avg_price
-            min_blocks_needed = 1
-
-        # Medium (40% - 60%) — charge only below average price
-        elif current_soc < 0.60:
-            target_soc = 0.80
-            price_limit = avg_price * 0.9  # Strictly below average
-            min_blocks_needed = 1
-
-        # High (60% - 80%) — charge only at bottom 10% cheapest
-        elif current_soc < 0.80:
-            target_soc = 1.00
-            price_limit = very_low_price_threshold
-            min_blocks_needed = 1
-
-        # Full (>= 80%) — charge only if price is negative
-        else:
-            target_soc = 1.00
-            price_limit = 0.0  # Only negative prices
-            min_blocks_needed = 1
-
-        # 5. Build contiguous windows of available slots
-        # Group consecutive available slots into windows, then rank windows
-        # by average price so we fill cheapest windows first — this ensures
-        # sessions are dense blocks at genuinely cheap periods, not scattered
-        # individual cheap slots that each become their own "session".
-        available = []
-        for t in range(current_idx, min(departure, total_intervals)):
-            if station_load[t] < _capacity and prices[t] <= price_limit:
-                available.append(t)
-
-        # Emergency: just charge immediately, cheapest window second
-        if current_soc < MIN_SOC_EMERGENCY:
-            available.sort()  # Time first for emergency
-        else:
-            available.sort()  # Keep time order; we'll pick windows by avg price
-
-        # Build contiguous windows from available slots
-        windows = []
-        if available:
-            win_start = available[0]
-            win_slots = [available[0]]
-            for t in available[1:]:
-                if t == win_slots[-1] + 1:
-                    win_slots.append(t)
-                else:
-                    windows.append(win_slots)
-                    win_slots = [t]
-            windows.append(win_slots)
-
-        # Rank windows by average price (cheapest first), emergency by time
-        if current_soc >= MIN_SOC_EMERGENCY:
-            windows.sort(key=lambda w: np.mean([prices[t] for t in w]))
-
-        final_schedule = []
-        sessions_count = 0
-
-        for window in windows:
-            if sessions_count >= MAX_SESSIONS_PER_DAY:
-                break
-            if current_soc >= target_soc:
-                break
-
-            session_slots = []
-            for t in window:
-                if current_soc >= target_soc:
-                    break
-                if station_load[t] < _capacity:
-                    energy_added = MAX_POWER_PER_CHARGER * 0.25
-                    current_kwh  = min(CAR_BATTERY_CAPACITY_KWH,
-                                       current_kwh + energy_added)
-                    current_soc  = current_kwh / CAR_BATTERY_CAPACITY_KWH
-                    session_slots.append(t)
-
-            if len(session_slots) >= min_blocks_needed:
-                for t in session_slots:
-                    final_schedule.append((t, prices[t]))
-                    station_load[t] += 1
-                sessions_count += 1
-
-        # Sort by time before saving — windows were added in price order,
-        # but the plan must be in chronological order for interval matching to work
-        final_schedule.sort(key=lambda x: x[0])
-
-        # Save to main schedule
-        for t, p in final_schedule:
-            schedule[car['id']].append({
-                "interval": t,
-                "power_kw": MAX_POWER_PER_CHARGER,
-                "price": p
-            })
-
-    # print(f"Scheduling complete in {time.time() - start_time:.4f} seconds.")
-    return schedule
+    # --- Price-sensitive decision ---
+    threshold = acceptable_price(soc, is_charging)
+    return current_price <= threshold

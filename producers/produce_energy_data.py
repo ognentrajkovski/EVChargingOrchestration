@@ -1,162 +1,299 @@
-import time
+"""
+Dynamic Bidding Price Producer  (multi-station)
+================================================
+Computes independent dynamic prices per charging station using a two-component
+algorithm per station:
+
+  Component 1 — Instantaneous utilisation (weight 60%, reactive):
+    Counts active chargers at THIS station → price state (off-peak / normal / peak).
+
+  Component 2 — Hourly profile (weight 40%, predictive):
+    Learns which hours are historically busy AT THIS STATION and raises prices
+    proactively before a rush arrives.
+
+  Final = (instant × 0.6) + (historic × 0.4)  + optional ×1.3 compound boost
+
+Publishes to `energy_data` as:
+  {
+    "type": "DYNAMIC_PRICE",
+    "stations": {
+      "station_A": { current_price, active_chargers, capacity, base_price, ... },
+      ...
+    },
+    "interval_idx": int,
+    "timestamp": float,
+    "hourly_profile": { ... }   # aggregate across all stations for dashboard
+  }
+"""
+
 import json
-import pandas as pd
+import time
+import threading
 import os
 import sys
+
 from kafka import KafkaProducer, KafkaConsumer
-import sys
-# producers/ -> go up one level to project root
+
+# Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 try:
     from ev_logger import log
     _log = lambda msg: log('ENERGY_PROD', msg)
-except Exception as e:
+except Exception:
     _log = lambda msg: print(f'[ENERGY_PROD] {msg}')
 
+from config.stations import STATIONS, PRICE_LEVELS
+
+# ---------------------------------------------------------------------------
 # Configuration
+# ---------------------------------------------------------------------------
 BOOTSTRAP_SERVERS = os.environ.get('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092')
-TOPIC_NAME = 'energy_data'
-TOPIC_COMMANDS = 'charging_commands'
+TOPIC_ENERGY      = 'energy_data'
+TOPIC_COMMANDS    = 'charging_commands'
+UPDATE_INTERVAL   = 1.25   # seconds per tick
 
-# --- ROBUST PATH FIX ---
-# This ensures we find the file whether you run from 'root' or 'producers/'
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CSV_FILE_PATH = os.path.join(SCRIPT_DIR, '../data/Austria_Energy_Reports.csv')
-
-# Time settings: 1 real second = 12 sim minutes → full sim day = 120 real seconds
-# 13:00 = interval 52 (52 × 15 sim-min = 780 sim-min = 13h)
-# NOTE: Flink's processing timer on ARM64 Docker fires at ~1.77s/interval (not 1.25s),
-# so one sim day = 96 × 1.77 ≈ 170 real seconds. Measured from log:
-#   batch@13:00 → midnight = 78s / 44 intervals = 1.77s/interval.
-INTERVAL_IDX_1300    = 52     # sim interval index for 13:00
-SECS_PER_INTERVAL    = 1.786  # measured: 50s extra → 28 interval shift → 1.786s/interval
-INTERVAL_SECONDS     = 159    # 120s→7:00, 170s→14:00, 163s→13:30, fine-tuned -4s→13:00
-FALLBACK_DELAY       = 5      # fallback if Flink idx can't be read
+INSTANT_WEIGHT  = 0.6
+HISTORIC_WEIGHT = 0.4
+MIN_HISTORY_OBS = 4
 
 
-def get_flink_interval_idx():
+# ---------------------------------------------------------------------------
+# Shared state — updated by the command-consumer thread
+# ---------------------------------------------------------------------------
+# Per-station active car sets  {station_id: set(car_ids)}
+station_active_car_ids: dict = {sid: set() for sid in STATIONS}
+station_lock = threading.Lock()
+
+sim_time_idx      = 48   # default 12:00
+sim_time_lock     = threading.Lock()
+
+# Reservation status from Flink  {station_id: {slot_idx_str: count}}
+reservation_lock  = threading.Lock()
+res_counts_per_station: dict = {}
+proj_prices_per_station: dict = {}
+
+# Per-station hourly learning profiles  {station_id: {hour: {peak_count, total_count}}}
+hourly_profiles: dict = {
+    sid: {h: {'peak_count': 0, 'total_count': 0} for h in range(24)}
+    for sid in STATIONS
+}
+hourly_lock = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
+# Pricing helpers
+# ---------------------------------------------------------------------------
+
+def _get_multiplier(active: int, capacity: int) -> float:
+    ratio = active / max(capacity, 1)
+    for upper, mult in PRICE_LEVELS:
+        if ratio <= upper:
+            return mult
+    return PRICE_LEVELS[-1][1]
+
+
+def compute_station_price(
+    active: int,
+    hour: int,
+    capacity: int,
+    base_price: float,
+    station_id: str,
+) -> dict:
     """
-    Read the FIRST charging_command from Flink (earliest offset) to find the
-    starting sim interval index. Used only at startup, when the topic is fresh.
-    Returns the interval_idx or None on failure.
+    Compute the dynamic price for one station and return a data dict.
     """
-    try:
-        consumer = KafkaConsumer(
-            TOPIC_COMMANDS,
-            bootstrap_servers=BOOTSTRAP_SERVERS,
-            value_deserializer=lambda x: json.loads(x.decode('utf-8')),
-            auto_offset_reset='earliest',
-            enable_auto_commit=False,
-            group_id=f'energy_sync_{int(time.time())}',
-            consumer_timeout_ms=30000,
-        )
-        for msg in consumer:
-            idx = msg.value.get('interval_idx')
-            if idx is not None:
-                consumer.close()
-                return idx
-        consumer.close()
-    except Exception as e:
-        print(f"  Could not read Flink idx: {e}")
-    return None
+    instant_mult  = _get_multiplier(active, capacity)
+    instant_price = base_price * instant_mult
 
+    with hourly_lock:
+        profile   = hourly_profiles[station_id][hour % 24]
+        total_obs = profile['total_count']
+        peak_obs  = profile['peak_count']
 
-def create_producer():
-    try:
-        producer = KafkaProducer(
-            bootstrap_servers=BOOTSTRAP_SERVERS,
-            value_serializer=lambda v: json.dumps(v).encode('utf-8')
-        )
-        print(f" Connected to Kafka at {BOOTSTRAP_SERVERS}")
-        return producer
-    except Exception as e:
-        print(f" Failed to connect to Kafka: {e}")
-        sys.exit(1)
-
-
-def send_batch(producer, df, start_index, label="TOMORROW"):
-    total_rows = len(df)
-    end_index = start_index + 96
-
-    if end_index <= total_rows:
-        batch = df.iloc[start_index:end_index]
+    if total_obs >= MIN_HISTORY_OBS:
+        peak_freq  = peak_obs / total_obs
+        off_mult   = PRICE_LEVELS[0][1]
+        peak_mult  = PRICE_LEVELS[-1][1]
+        hist_mult  = off_mult + (peak_mult - off_mult) * peak_freq
+        hist_price = base_price * hist_mult
     else:
-        remaining = total_rows - start_index
-        batch_part1 = df.iloc[start_index:total_rows]
-        batch_part2 = df.iloc[0: (96 - remaining)]
-        batch = pd.concat([batch_part1, batch_part2])
+        peak_freq  = None
+        hist_price = instant_price
 
-    print(f" Sending 96 prices for {label}...")
-    prices_sent = []
-    for _, row in batch.iterrows():
-        record = row.to_dict()
-        record['sent_at'] = time.time()
-        record['type'] = label
-        producer.send(TOPIC_NAME, record)
-        prices_sent.append(record.get('AT_price_day_ahead', 0))
+    blended = instant_price * INSTANT_WEIGHT + hist_price * HISTORIC_WEIGHT
 
-    producer.flush()
-    _log(f"BATCH_SENT | label={label} | count={len(prices_sent)} | min={min(prices_sent):.1f} | max={max(prices_sent):.1f} | avg={sum(prices_sent)/len(prices_sent):.1f} | start_idx={start_index}")
-    return end_index % total_rows
+    instant_is_peak = instant_mult >= PRICE_LEVELS[-1][1]
+    hist_is_peak    = peak_freq is not None and peak_freq >= 0.6
+    compound        = 1.3 if (instant_is_peak and hist_is_peak) else 1.0
 
+    final_price = round(blended * compound, 4)
+
+    price_state = (
+        'peak'     if instant_mult >= PRICE_LEVELS[-1][1] else
+        'normal'   if instant_mult >= PRICE_LEVELS[1][1]  else
+        'off_peak'
+    )
+
+    return {
+        'current_price':   final_price,
+        'instant_price':   round(instant_price, 4),
+        'hist_price':      round(hist_price, 4),
+        'peak_freq':       round(peak_freq, 3) if peak_freq is not None else None,
+        'compound_boost':  compound > 1.0,
+        'price_state':     price_state,
+        'active_chargers': active,
+        'capacity':        capacity,
+        'base_price':      base_price,
+    }
+
+
+def _update_hourly_profile(station_id: str, hour: int, is_peak: bool):
+    with hourly_lock:
+        hourly_profiles[station_id][hour % 24]['total_count'] += 1
+        if is_peak:
+            hourly_profiles[station_id][hour % 24]['peak_count'] += 1
+
+
+def _snapshot_hourly_profile():
+    """Aggregate hourly profile across all stations for dashboard display."""
+    with hourly_lock:
+        aggregate = {}
+        for h in range(24):
+            total = sum(hourly_profiles[sid][h]['total_count'] for sid in STATIONS)
+            peaks = sum(hourly_profiles[sid][h]['peak_count'] for sid in STATIONS)
+            aggregate[str(h)] = {'peak_count': peaks, 'total_count': total}
+        return aggregate
+
+
+# ---------------------------------------------------------------------------
+# Command consumer
+# ---------------------------------------------------------------------------
+
+def consume_commands():
+    """
+    Background thread: listens to charging_commands and tracks active chargers
+    per station. Also receives RESERVATION_STATUS from Flink.
+    """
+    global sim_time_idx
+
+    consumer = KafkaConsumer(
+        TOPIC_COMMANDS,
+        bootstrap_servers=BOOTSTRAP_SERVERS,
+        group_id='energy_producer_occupancy',
+        value_deserializer=lambda x: json.loads(x.decode('utf-8')),
+        auto_offset_reset='latest',
+    )
+    _log('Command consumer started — tracking per-station charger occupancy')
+
+    for message in consumer:
+        cmd = message.value
+
+        # ── RESERVATION_STATUS from Flink ──────────────────────────────
+        if cmd.get('type') == 'RESERVATION_STATUS':
+            per_stn = cmd.get('reservation_counts_per_station', {})
+            proj    = cmd.get('projected_prices', [])  # aggregate backward-compat
+            with reservation_lock:
+                res_counts_per_station.clear()
+                res_counts_per_station.update(per_stn)
+                # Also store per-station projected prices if present
+                for sid, sdata in cmd.get('stations', {}).items():
+                    proj_prices_per_station[sid] = sdata.get('projected_prices', [])
+            continue
+
+        car_id = cmd.get('car_id', '')
+        action = cmd.get('action', '')
+        sid    = cmd.get('station_id')   # NEW field from multi-station Flink
+
+        # Sync simulation clock
+        with sim_time_lock:
+            if cmd.get('interval_idx') is not None:
+                sim_time_idx = cmd['interval_idx']
+
+        with station_lock:
+            if action == 'START_CHARGING' and sid and sid in station_active_car_ids:
+                station_active_car_ids[sid].add(car_id)
+            elif action == 'STOP_CHARGING':
+                # Remove from whichever station this car was at
+                for s in station_active_car_ids:
+                    station_active_car_ids[s].discard(car_id)
+
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
 
 def main():
-    print(" Energy Market Simulator Starting...")
-    print(f" Looking for data at: {os.path.abspath(CSV_FILE_PATH)}")
+    print('Multi-Station Dynamic Price Producer Starting...')
+    for sid, stn in STATIONS.items():
+        print(f"  {sid} ({stn['name']}): base={stn['base_price']} EUR/MWh | capacity={stn['capacity']}")
 
-    try:
-        df = pd.read_csv(CSV_FILE_PATH, sep=';')
-        print(f" Loaded CSV with {len(df)} rows.")
-        if 'AT_price_day_ahead' not in df.columns:
-            print(" ERROR: Column 'AT_price_day_ahead' not found in CSV!")
-            print(f"Found columns: {df.columns.tolist()}")
-            return
-    except FileNotFoundError:
-        print(f" CRITICAL ERROR: File not found at {CSV_FILE_PATH}")
-        print("Please check that 'data/Austria_Energy_Reports.csv' exists.")
-        return
+    t = threading.Thread(target=consume_commands, daemon=True)
+    t.start()
 
-    producer = create_producer()
-    current_index = 0
+    producer = KafkaProducer(
+        bootstrap_servers=BOOTSTRAP_SERVERS,
+        value_serializer=lambda v: json.dumps(v).encode('utf-8'),
+    )
+    _log(f'Connected to Kafka at {BOOTSTRAP_SERVERS}')
 
-    # --- Align with Flink's sim clock ---
-    # Instead of a fixed delay, read Flink's current interval_idx and compute
-    # exactly how many real seconds remain until sim 13:00 (idx=52).
-    # This guarantees the first batch arrives at 13:00 regardless of Docker startup time.
-    print(" Reading Flink's current sim clock from charging_commands...")
-    flink_idx = get_flink_interval_idx()
-
-    if flink_idx is not None:
-        # (52 - idx) % 96 gives intervals until next 13:00 (wraps to next day if past 13:00)
-        intervals_to_wait = (INTERVAL_IDX_1300 - flink_idx) % 96
-        wait_secs = intervals_to_wait * SECS_PER_INTERVAL
-        sim_now_h = (flink_idx * 15) // 60
-        sim_now_m = (flink_idx * 15) % 60
-        print(f"  Flink sim clock: {sim_now_h:02d}:{sim_now_m:02d} (idx={flink_idx})")
-        print(f"  Waiting {wait_secs:.1f}s ({intervals_to_wait} intervals) for 13:00 market clearing...")
-        _log(f"CLOCK_SYNC | flink_idx={flink_idx} | wait={wait_secs:.1f}s")
-        time.sleep(wait_secs)
-    else:
-        print(f"  Could not read Flink clock — using fallback {FALLBACK_DELAY}s delay")
-        time.sleep(FALLBACK_DELAY)
-
-    print("\n--- Market Cleared (13:00) — sending Tomorrow's Prices ---")
-    _log("MARKET_CLEAR 13:00 — sending TOMORROW")
-    current_index = send_batch(producer, df, current_index, label="TOMORROW")
-    _log(f"TOMORROW sent. next_index={current_index}")
-
+    tick = 0
     try:
         while True:
-            print(f" Waiting {INTERVAL_SECONDS}s for next Market Clearing (13:00)...")
-            time.sleep(INTERVAL_SECONDS)
+            with sim_time_lock:
+                s_idx = sim_time_idx
+            hour = (s_idx * 15) // 60
 
-            print("\n--- Market Cleared (13:00) ---")
-            _log(f"MARKET_CLEAR — sending new TOMORROW batch")
-            current_index = send_batch(producer, df, current_index, label="TOMORROW")
-            _log(f"TOMORROW sent. next_index={current_index}")
+            # ── Compute price per station ──────────────────────────────
+            with station_lock:
+                active_snapshot = {sid: len(ids) for sid, ids in station_active_car_ids.items()}
+
+            stations_payload = {}
+            for sid, stn in STATIONS.items():
+                n_active   = active_snapshot.get(sid, 0)
+                sdata      = compute_station_price(
+                    n_active, hour, stn['capacity'], stn['base_price'], sid)
+                _update_hourly_profile(sid, hour, sdata['price_state'] == 'peak')
+                # Embed this station's own learned hourly profile so the dashboard
+                # can show per-station peak-frequency charts.
+                with hourly_lock:
+                    sdata['hourly_profile'] = {
+                        str(h): dict(hourly_profiles[sid][h]) for h in range(24)
+                    }
+                stations_payload[sid] = sdata
+
+            profile_snapshot = _snapshot_hourly_profile()
+
+            with reservation_lock:
+                flat_res  = dict(res_counts_per_station)
+                flat_proj = dict(proj_prices_per_station)
+
+            record = {
+                'type':          'DYNAMIC_PRICE',
+                'stations':      stations_payload,
+                'interval_idx':  s_idx,
+                'sim_hour':      hour,
+                'timestamp':     time.time(),
+                'hourly_profile': profile_snapshot,
+                # Backward-compat aggregate fields (first station's data)
+                'current_price': stations_payload.get('station_A', {}).get('current_price', 50.0),
+                'active_chargers': sum(active_snapshot.values()),
+                'total_chargers':  sum(s['capacity'] for s in STATIONS.values()),
+                'reservation_counts_per_station': flat_res,
+            }
+            producer.send(TOPIC_ENERGY, record)
+
+            if tick % 20 == 0:
+                parts = [
+                    f"{sid}={v['current_price']:.1f}€({v['active_chargers']}/{v['capacity']})"
+                    for sid, v in stations_payload.items()
+                ]
+                _log(f'tick={tick} | hour={hour:02d} | ' + ' | '.join(parts))
+
+            tick += 1
+            time.sleep(UPDATE_INTERVAL)
 
     except KeyboardInterrupt:
-        print("Producer stopped.")
+        print('\nEnergy producer stopped.')
     finally:
         producer.close()
 
