@@ -2,3 +2,4 @@ kafka-python-ng
 pandas
 numpy
 streamlit
+networkx

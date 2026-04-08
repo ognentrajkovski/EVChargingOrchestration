@@ -7,6 +7,7 @@ import sys, os
 # producers/ -> go up one level to project root
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ev_logger import log, log_error
+from config.stations import MOVE_STEP
 
 # Configuration
 NUM_CARS = 40
@@ -15,6 +16,7 @@ TOPIC_REAL = "cars_real"
 TOPIC_COMMANDS = "charging_commands"
 BOOTSTRAP_SERVERS = os.environ.get('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092')
 BATTERY_CAPACITY_KWH = 60.0
+GRID_SIZE = 10.0   # km — grid spans 0..10 in both axes
 
 class Car:
     def __init__(self, car_id, group_name, start_battery, priority, k):
@@ -25,16 +27,23 @@ class Car:
         self.k = k
         self.is_charging = False
         self.is_parked = False  # Cars start driving; Flink will send START_CHARGING when a plan slot arrives
+        # 2D position on the grid (km)
+        self.x = random.uniform(0.0, GRID_SIZE)
+        self.y = random.uniform(0.0, GRID_SIZE)
 
     def update(self, demand_mult: float = 1.0):
         if self.is_charging:
             # Flink controls charging — battery updated via START_CHARGING commands
+            # Position stays fixed while plugged in
             log('CAR_UPDATE', f"{self.id} | CHARGING | batt={self.battery_level:.1f}%")
         elif not self.is_parked:
             # Driving — discharge at rate scaled by current demand multiplier.
             # High multiplier (peak hours) → faster drain → more cars need charging soon.
             self.battery_level = max(0.0, self.battery_level - self.k * demand_mult)
-            log('CAR_UPDATE', f"{self.id} | DRIVING | batt={self.battery_level:.1f}% | demand_mult={demand_mult:.1f}")
+            # Move slightly in 2D space each tick
+            self.x = max(0.0, min(GRID_SIZE, self.x + random.uniform(-MOVE_STEP, MOVE_STEP)))
+            self.y = max(0.0, min(GRID_SIZE, self.y + random.uniform(-MOVE_STEP, MOVE_STEP)))
+            log('CAR_UPDATE', f"{self.id} | DRIVING | batt={self.battery_level:.1f}% | demand_mult={demand_mult:.1f} | pos=({self.x:.1f},{self.y:.1f})")
 
     def to_dict(self):
         return {
@@ -44,6 +53,8 @@ class Car:
             "current_soc": self.battery_level / 100.0,
             "priority": self.priority,
             "plugged_in": self.is_parked,  # Important for Flink
+            "x": round(self.x, 4),
+            "y": round(self.y, 4),
             "timestamp": time.time()
         }
 
@@ -119,14 +130,16 @@ def consume_commands():
                 car = cars_map[car_id]
                 if action == 'START_CHARGING':
                     log('CAR_PROD', f"{car_id} | START_CHARGING | new_soc={new_soc} | batt_before={car.battery_level:.1f}%")
-                    if new_soc is not None and (new_soc * 100.0) > car.battery_level:
+                    if new_soc is not None:
+                        # Flink is the authority on SOC while managing the car — sync unconditionally
                         car.battery_level = new_soc * 100.0
                     car.is_charging = True
                     car.is_parked   = True
                     log('CAR_PROD', f"{car_id} | after START | batt={car.battery_level:.1f}%")
                 elif action == 'STOP_CHARGING':
                     log('CAR_PROD', f"{car_id} | STOP_CHARGING | new_soc={new_soc} | batt_before={car.battery_level:.1f}%")
-                    if new_soc is not None and (new_soc * 100.0) > car.battery_level:
+                    if new_soc is not None:
+                        # Sync to Flink's final SOC value before handing back control to the car
                         car.battery_level = new_soc * 100.0
                     car.is_charging = False
                     car.is_parked = False
@@ -144,7 +157,7 @@ def main():
     for i in range(1, NUM_CARS + 1):
         start_battery = random.uniform(10.0, 100.0)
         priority = random.randint(1, 5)
-        discharge_k = random.uniform(0.4, 1.0)  # % per tick (2.5s)
+        discharge_k = random.uniform(0.4, 1.0)  # % per tick (1.25s = 1 simulated 15-min slot)
 
         cars_map[f"car_{i}"] = Car(f"car_{i}", "real", start_battery, priority, discharge_k)
 

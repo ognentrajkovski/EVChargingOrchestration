@@ -64,12 +64,12 @@ sleep 1
 
 cd producers
 # Start car producer so Flink has input and begins firing timer ticks
-nohup python -u produce_car_data.py > cars.log 2>&1 &
+nohup python3 -u produce_car_data.py > cars.log 2>&1 &
 echo "  Car Producer started (PID $!)"
 
 # Start energy producer — it listens to Flink's charging commands to count
 # active chargers and broadcasts the real-time dynamic price every tick.
-nohup python -u produce_energy_data.py > energy.log 2>&1 &
+nohup python3 -u produce_energy_data.py > energy.log 2>&1 &
 echo "  Energy Producer started (PID $!)"
 cd ..
 echo "  All producers started. Logs: producers/cars.log, producers/energy.log"

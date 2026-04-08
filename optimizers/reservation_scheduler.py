@@ -48,11 +48,21 @@ def target_soc(current_soc: float) -> float:
 
 
 def slots_needed(current_soc: float) -> int:
-    """How many 15-min slots are needed to reach target SOC."""
+    """How many 15-min slots are needed to reach target SOC.
+
+    For non-emergency cars, the cheapest slots are spread across the day rather
+    than being consecutive.  The car continues discharging between those slots,
+    so we add a 15 % buffer on the energy delta to compensate for the expected
+    discharge between charging events.  Emergency cars charge consecutively so
+    no buffer is applied for them.
+    """
     target = target_soc(current_soc)
     energy_needed = (target - current_soc) * CAR_BATTERY_CAPACITY_KWH
     if energy_needed <= 0:
         return 0
+    is_emergency = current_soc < 0.15
+    if not is_emergency:
+        energy_needed *= 1.15  # 15 % buffer for discharge between spread slots
     return ceil(energy_needed / ENERGY_PER_SLOT)
 
 

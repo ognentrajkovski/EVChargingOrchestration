@@ -3,16 +3,25 @@ import sys
 import time
 import json
 import uuid
+import math
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+import plotly.io as pio
+# Force plotly to use the stdlib json engine instead of orjson.
+# orjson can partially-initialise under Streamlit's multi-thread re-runs on
+# Python 3.9, producing "partially initialized module 'orjson'" errors.
+pio.json.config.default_engine = 'json'
 from kafka import KafkaConsumer
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) if '__file__' in dir() else '.'
 sys.path.insert(0, _root)
+# Make fleet_graph importable (lives in optimizers/)
+sys.path.insert(0, os.path.join(_root, 'optimizers'))
+sys.path.insert(0, os.path.join(_root, 'config'))
 try:
     from ev_logger import log
     _dash_log = lambda msg: log('DASH', msg)
@@ -252,8 +261,22 @@ BOOTSTRAP_SERVERS    = os.environ.get('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092
 TOPIC_ENERGY         = 'energy_data'
 TOPIC_CARS           = 'cars_real'
 TOPIC_COMMANDS       = 'charging_commands'
-STATION_CAPACITY     = 5
-BASE_PRICE           = 50.0
+
+# Load station config — fall back gracefully if config not importable yet
+try:
+    _cfg_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    sys.path.insert(0, _cfg_root)
+    from config.stations import STATIONS
+except Exception:
+    STATIONS = {
+        "station_A": {"name": "Alpha",  "x": 2.0, "y": 2.0, "base_price": 50.0, "capacity": 5},
+        "station_B": {"name": "Beta",   "x": 8.0, "y": 8.0, "base_price": 40.0, "capacity": 3},
+        "station_C": {"name": "Gamma",  "x": 5.0, "y": 2.0, "base_price": 70.0, "capacity": 4},
+    }
+
+STATION_CAPACITY     = max(s['capacity'] for s in STATIONS.values())   # largest single station
+TOTAL_CAPACITY       = sum(s['capacity'] for s in STATIONS.values())    # fleet-wide total
+BASE_PRICE           = min(s['base_price'] for s in STATIONS.values())  # cheapest station base
 
 # State-based price levels — must match produce_energy_data.py PRICE_LEVELS
 # (label, occupancy_upper, multiplier, color)
@@ -273,12 +296,20 @@ defaults = {
     'cars':                    {},      # car_id → latest telemetry dict
     'car_decisions':           {},      # car_id → 'CHARGING'|'IDLE'|'DEFERRED_PRICE'|'DEFERRED_FULL'|'EMERGENCY'
     'car_reserved_slots':      {},      # car_id → list of reserved slot indices
-    'reservation_counts':      {},      # str(slot_idx) → count of reservations
-    'projected_prices':        [],      # list of 96 floats
+    'reservation_counts':      {},      # str(slot_idx) → count of reservations (aggregate)
+    'projected_prices':        [],      # list of 96 floats (aggregate)
     'hourly_profile':          {},      # str(hour) → {peak_count, total_count}
     'instant_price':           None,   # last instantaneous component price
     'hist_price':              None,   # last historical component price
     'compound_boost':          False,  # whether compound boost is active
+    # Multi-station fields
+    'station_data':            {},      # station_id → {current_price, active_chargers, capacity, base_price, ...}
+    'car_stations':            {},      # car_id → station_id (last known assignment)
+    'per_station_reservation_counts': {},  # station_id → {str(slot_idx): count}
+    'per_station_projected_prices':   {},  # station_id → [96 floats]
+    'station_price_histories':   {},     # station_id → rolling list of prices (PRICE_HISTORY_LEN)
+    'station_charger_histories': {},    # station_id → rolling list of active_chargers counts
+    'station_hourly_profiles':   {},    # station_id → {str(hour): {peak_count, total_count}}
     'price_day_snapshots':     [],      # list of {'label': str, 'prices': [96 floats]}
     'last_snapshot_day':       -1,      # last day_idx we snapshotted
     'kafka_ready':             False,
@@ -340,8 +371,43 @@ def poll_kafka():
                 # ── Energy / price topic ──────────────────────────────────────
                 if topic == TOPIC_ENERGY:
                     if data.get('type') == 'DYNAMIC_PRICE':
+                        # ── Multi-station per-station data ────────────────────
+                        stations_payload = data.get('stations', {})
+                        if stations_payload:
+                            st.session_state['station_data'].update(stations_payload)
+                            # Per-station rolling price history
+                            _ph   = st.session_state['station_price_histories']
+                            _ch   = st.session_state['station_charger_histories']
+                            _sp_prof = st.session_state['station_hourly_profiles']
+                            for _sid, _sd in stations_payload.items():
+                                # price history
+                                if _sid not in _ph:
+                                    _ph[_sid] = []
+                                _ph[_sid].append(_sd.get('current_price', 0.0))
+                                if len(_ph[_sid]) > PRICE_HISTORY_LEN:
+                                    _ph[_sid].pop(0)
+                                # charger count history
+                                if _sid not in _ch:
+                                    _ch[_sid] = []
+                                _ch[_sid].append(_sd.get('active_chargers', 0))
+                                if len(_ch[_sid]) > PRICE_HISTORY_LEN:
+                                    _ch[_sid].pop(0)
+                                # learned hourly profile
+                                if 'hourly_profile' in _sd:
+                                    _sp_prof[_sid] = _sd['hourly_profile']
+
+                        # Aggregate/backward-compat fields
                         price    = data.get('current_price')
                         chargers = data.get('active_chargers', 0)
+                        # Derive aggregate price from station data if not explicitly provided
+                        if price is None and stations_payload:
+                            prices_weighted = [
+                                v.get('current_price', 50.0) * v.get('capacity', 1)
+                                for v in stations_payload.values()
+                            ]
+                            total_cap = sum(v.get('capacity', 1) for v in stations_payload.values())
+                            price = sum(prices_weighted) / max(total_cap, 1)
+
                         if price is not None:
                             st.session_state['topic_counts']['energy_data'] += 1
 
@@ -358,9 +424,17 @@ def poll_kafka():
                                 st.session_state['time_labels'].pop(0)
                                 st.session_state['active_chargers_hist'].pop(0)
 
-                            # Capture per-component breakdown from energy producer
+                            # Capture per-component breakdown (use first station if multi)
                             if 'hourly_profile' in data:
                                 st.session_state['hourly_profile'] = data['hourly_profile']
+                            first_stn = next(iter(stations_payload.values()), {})
+                            if 'instant_price' in first_stn:
+                                st.session_state['instant_price'] = first_stn['instant_price']
+                            if 'hist_price' in first_stn:
+                                st.session_state['hist_price'] = first_stn['hist_price']
+                            if 'compound_boost' in first_stn:
+                                st.session_state['compound_boost'] = first_stn['compound_boost']
+                            # Backward-compat single-station fields
                             if 'instant_price' in data:
                                 st.session_state['instant_price'] = data['instant_price']
                             if 'hist_price' in data:
@@ -404,11 +478,23 @@ def poll_kafka():
                     if data.get('type') == 'RESERVATION_STATUS':
                         st.session_state['reservation_counts'] = data.get('reservation_counts', {})
                         st.session_state['projected_prices'] = data.get('projected_prices', [])
+                        # Multi-station fields
+                        per_stn = data.get('reservation_counts_per_station', {})
+                        if per_stn:
+                            st.session_state['per_station_reservation_counts'].update(per_stn)
+                        for sid, sdata in data.get('stations', {}).items():
+                            pp = sdata.get('projected_prices')
+                            if pp:
+                                st.session_state['per_station_projected_prices'][sid] = pp
                         continue
 
                     car_id = data.get('car_id')
                     action = data.get('action', '')
                     reason = data.get('reason', '')
+                    # Track which station each car is assigned to
+                    assigned_sid = data.get('station_id')
+                    if car_id and assigned_sid:
+                        st.session_state['car_stations'][car_id] = assigned_sid
                     if car_id:
                         if action == 'START_CHARGING':
                             label = 'EMERGENCY' if 'emergency' in reason.lower() else 'CHARGING'
@@ -481,37 +567,45 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-# ── Clock strip ────────────────────────────────────────────────────────────────
-price_col     = ('#ff4b4b' if current_price is not None and current_price > BASE_PRICE * 1.4
-                 else '#26de81' if current_price is not None and current_price <= BASE_PRICE * 1.1
-                 else '#fed330')
-charger_col   = occupancy_color(current_chargers)
-price_display = f'{current_price:.1f} <span style="font-size:1rem">€</span>' if current_price is not None else '—'
 
-st.markdown(f"""
-<div class="clock-strip">
-  <div class="clock-cell">
-    <div class="clock-label">Live Price</div>
-    <div class="clock-val" style="color:{price_col}">{price_display}</div>
-  </div>
-  <div class="clock-cell">
-    <div class="clock-label">Active Chargers</div>
-    <div class="clock-val" style="color:{charger_col}">{current_chargers} <span style="font-size:1rem;color:#1a3048">/ {STATION_CAPACITY}</span></div>
-  </div>
-  <div class="clock-cell">
-    <div class="clock-label">Cars Plugged In</div>
-    <div class="clock-val">{charging_count}</div>
-  </div>
-  <div class="clock-cell">
-    <div class="clock-label">Base Price</div>
-    <div class="clock-val accent">{BASE_PRICE:.0f} <span style="font-size:1rem">€</span></div>
-  </div>
-  <div class="clock-cell">
-    <div class="clock-label">Peak Multiplier</div>
-    <div class="clock-val">×{PRICE_STATES[-1][2]:.1f}</div>
-  </div>
-</div>
-""", unsafe_allow_html=True)
+# ── Station overview row ───────────────────────────────────────────────────────
+station_data = st.session_state.get('station_data', {})
+_stn_cols = st.columns(len(STATIONS))
+for _col, (sid, stn_cfg) in zip(_stn_cols, STATIONS.items()):
+    with _col:
+        _sd      = station_data.get(sid, {})
+        _sp      = _sd.get('current_price', stn_cfg['base_price'])
+        _sa      = _sd.get('active_chargers', 0)
+        _cap     = stn_cfg['capacity']
+        _occ_col = occupancy_color(_sa, _cap)
+        _price_col = ('#ff4b4b' if _sp > stn_cfg['base_price'] * 1.4
+                      else '#26de81' if _sp <= stn_cfg['base_price'] * 1.05
+                      else '#fed330')
+        _state_lbl = _sd.get('price_state', 'off_peak').replace('_', '-').upper()
+        st.markdown(f"""
+        <div style="background:#080f1a;border:1px solid #0f1f30;border-radius:10px;padding:0.6rem 0.8rem;
+                    margin-bottom:0.6rem;border-left:3px solid {_price_col}">
+          <div style="font-family:JetBrains Mono,monospace;font-size:0.55rem;color:#4a6070;
+                      letter-spacing:0.12em;text-transform:uppercase">{sid.replace('_',' ')} — {stn_cfg['name']}</div>
+          <div style="display:flex;align-items:baseline;gap:8px;margin-top:2px">
+            <span style="font-family:JetBrains Mono,monospace;font-size:1.1rem;
+                         font-weight:700;color:{_price_col}">{_sp:.1f}</span>
+            <span style="font-size:0.6rem;color:#4a6070">€/MWh</span>
+            <span style="font-family:JetBrains Mono,monospace;font-size:0.55rem;
+                         color:{_price_col};margin-left:4px">{_state_lbl}</span>
+          </div>
+          <div style="display:flex;align-items:center;gap:6px;margin-top:4px">
+            <div style="flex:1;height:4px;background:#0a1525;border-radius:2px;overflow:hidden">
+              <div style="height:100%;width:{int(_sa/_cap*100) if _cap else 0}%;
+                          background:{_occ_col};border-radius:2px"></div>
+            </div>
+            <span style="font-family:JetBrains Mono,monospace;font-size:0.6rem;color:{_occ_col}">{_sa}/{_cap}</span>
+          </div>
+          <div style="font-family:JetBrains Mono,monospace;font-size:0.55rem;color:#2d4a62;margin-top:3px">
+            Base {stn_cfg['base_price']:.0f}€ · ({stn_cfg['x']:.0f},{stn_cfg['y']:.0f}) km
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
 
 # ── Shared charger schedule (used by Reservation Board + Charging Stations) ───
 _car_res = st.session_state.get('car_reserved_slots', {})
@@ -552,127 +646,57 @@ with left_col:
     # ── Dynamic price sparkline ──────────────────────────────────────────────
     st.markdown('<div class="section-hdr">Real-Time Price Feed (€/MWh)</div>', unsafe_allow_html=True)
 
-    # Current price state badge — always visible
-    _off_p, _norm_p, _peak_p = [BASE_PRICE * m for _, m, *_ in [(s[0], s[2]) for s in PRICE_STATES]]
-    _cr = (current_chargers or 0) / STATION_CAPACITY
-    if _cr > PRICE_STATES[1][1]:
-        _state_lbl, _state_col, _state_price = 'PEAK',     '#ff4b4b', _peak_p
-    elif _cr > PRICE_STATES[0][1]:
-        _state_lbl, _state_col, _state_price = 'NORMAL',   '#fed330', _norm_p
-    else:
-        _state_lbl, _state_col, _state_price = 'OFF-PEAK', '#26de81', _off_p
+    _stn_histories = st.session_state.get('station_price_histories', {})
+    _t_labels      = list(st.session_state['time_labels'])
+    # Per-station line colours (one per station, stable order)
+    _STN_LINE_COLS = ['#00e5ff', '#26de81', '#fed330']
+    _has_any_history = any(len(v) > 0 for v in _stn_histories.values())
 
-    _cur_p_disp  = f'{current_price:.1f}' if current_price is not None else f'{_state_price:.1f}'
-    _inst_p      = st.session_state.get('instant_price')
-    _hist_p      = st.session_state.get('hist_price')
-    _compound    = st.session_state.get('compound_boost', False)
-    _boost_badge = (
-        '<span style="background:#ff4b4b;color:#fff;font-size:0.55rem;padding:2px 6px;'
-        'border-radius:4px;letter-spacing:0.06em;margin-left:8px">⚡ COMPOUND PEAK</span>'
-        if _compound else ''
-    )
-    _breakdown = ''
-    if _inst_p is not None and _hist_p is not None:
-        _breakdown = (
-            f'<div style="font-family:JetBrains Mono,monospace;font-size:0.6rem;color:#4a6070;margin-top:3px">'
-            f'Instant <span style="color:#00e5ff">{_inst_p:.0f}€</span> ×60%'
-            f' &nbsp;+&nbsp; Learned <span style="color:#7c5cbf">{_hist_p:.0f}€</span> ×40%'
-            f'{" &nbsp;+&nbsp; <span style=\'color:#ff4b4b\'>×1.3 boost</span>" if _compound else ""}'
-            f' &nbsp;= <span style="color:{_state_col};font-weight:700">{_cur_p_disp}€</span>'
-            f'</div>'
-        )
-    st.markdown(f'''
-    <div style="padding:0.5rem 0.8rem;background:{_state_col}12;border:1px solid {_state_col}40;
-                border-radius:10px;margin-bottom:0.4rem">
-      <div style="display:flex;align-items:center;gap:16px">
-        <div style="font-family:JetBrains Mono,monospace">
-          <div style="font-size:0.6rem;color:#4a6070;letter-spacing:0.1em">CURRENT STATE</div>
-          <div style="font-size:1.2rem;font-weight:700;color:{_state_col};letter-spacing:0.08em">{_state_lbl}{_boost_badge}</div>
-        </div>
-        <div style="width:1px;height:36px;background:{_state_col}30"></div>
-        <div style="font-family:JetBrains Mono,monospace">
-          <div style="font-size:0.6rem;color:#4a6070;letter-spacing:0.1em">PRICE NOW</div>
-          <div style="font-size:1.2rem;font-weight:700;color:{_state_col}">{_cur_p_disp} <span style="font-size:0.7rem">€/MWh</span></div>
-        </div>
-        <div style="width:1px;height:36px;background:{_state_col}30"></div>
-        <div style="font-family:JetBrains Mono,monospace">
-          <div style="font-size:0.6rem;color:#4a6070;letter-spacing:0.1em">CHARGERS BUSY</div>
-          <div style="font-size:1.2rem;font-weight:700;color:{_state_col}">{current_chargers or 0}<span style="font-size:0.7rem;color:#4a6070"> / {STATION_CAPACITY}</span></div>
-        </div>
-        <div style="flex:1"></div>
-        <div style="font-family:JetBrains Mono,monospace;font-size:0.6rem;color:#4a6070;text-align:right">
-          OFF-PEAK <span style="color:#26de81">{BASE_PRICE*PRICE_STATES[0][2]:.0f}€</span> &nbsp;·&nbsp;
-          NORMAL <span style="color:#fed330">{BASE_PRICE*PRICE_STATES[1][2]:.0f}€</span> &nbsp;·&nbsp;
-          PEAK <span style="color:#ff4b4b">{BASE_PRICE*PRICE_STATES[2][2]:.0f}€</span> &nbsp;·&nbsp;
-          COMPOUND <span style="color:#ff4b4b">up to {BASE_PRICE*PRICE_STATES[2][2]*1.3:.0f}€</span>
-        </div>
-      </div>
-      {_breakdown}
-    </div>
-    ''', unsafe_allow_html=True)
-
-    if dynamic_prices:
-        n_pts    = len(dynamic_prices)
-        x_vals   = list(range(-n_pts + 1, 1))
-        t_labels = list(st.session_state['time_labels'])[-n_pts:]
-        t_labels = t_labels + [''] * (n_pts - len(t_labels))
-
-        # Determine color of each point by its price state
-        def _price_color(p):
-            if p >= BASE_PRICE * PRICE_STATES[2][2] * 0.9:   return '#ff4b4b'
-            if p >= BASE_PRICE * PRICE_STATES[1][2] * 0.9:   return '#fed330'
-            return '#26de81'
-
-        pt_colors = [_price_color(p) for p in dynamic_prices]
-
+    if _has_any_history:
         fig = go.Figure()
+        # Coloured background bands for price zones (based on cheapest station)
+        fig.add_hrect(y0=0, y1=BASE_PRICE*PRICE_STATES[0][2],
+                      fillcolor='rgba(38,222,129,0.04)', line_width=0)
+        fig.add_hrect(y0=BASE_PRICE*PRICE_STATES[0][2], y1=BASE_PRICE*PRICE_STATES[1][2],
+                      fillcolor='rgba(254,211,48,0.04)', line_width=0)
+        fig.add_hrect(y0=BASE_PRICE*PRICE_STATES[1][2], y1=BASE_PRICE*PRICE_STATES[2][2]*1.5,
+                      fillcolor='rgba(255,75,75,0.04)', line_width=0)
 
-        # Colored background bands for each price zone
-        fig.add_hrect(y0=0,               y1=BASE_PRICE*PRICE_STATES[0][2], fillcolor='rgba(38,222,129,0.04)', line_width=0)
-        fig.add_hrect(y0=BASE_PRICE*PRICE_STATES[0][2], y1=BASE_PRICE*PRICE_STATES[1][2], fillcolor='rgba(254,211,48,0.04)',  line_width=0)
-        fig.add_hrect(y0=BASE_PRICE*PRICE_STATES[1][2], y1=BASE_PRICE*PRICE_STATES[2][2]*1.2, fillcolor='rgba(255,75,75,0.04)',   line_width=0)
+        _all_prices = []
+        for _i, (_sid, _stn_cfg) in enumerate(STATIONS.items()):
+            _prices = _stn_histories.get(_sid, [])
+            if not _prices:
+                continue
+            _all_prices.extend(_prices)
+            _n   = len(_prices)
+            _xs  = list(range(-_n + 1, 1))
+            _col = _STN_LINE_COLS[_i % len(_STN_LINE_COLS)]
+            _tlbs = _t_labels[-_n:] + [''] * max(0, _n - len(_t_labels))
+            fig.add_trace(go.Scatter(
+                x=_xs, y=_prices,
+                mode='lines',
+                name=f"{_stn_cfg['name']} ({_stn_cfg['base_price']:.0f}€ base)",
+                line=dict(color=_col, width=2),
+                customdata=_tlbs,
+                hovertemplate=f"<b>{_stn_cfg['name']}</b><br>%{{customdata}}<br>%{{y:.1f}} €/MWh<extra></extra>",
+            ))
 
-        # Price line — colored segments by state
-        # Draw as separate segments so each can have its own color
-        prev_col = pt_colors[0]
-        seg_x, seg_y = [x_vals[0]], [dynamic_prices[0]]
-        for i in range(1, n_pts):
-            seg_x.append(x_vals[i])
-            seg_y.append(dynamic_prices[i])
-            if pt_colors[i] != prev_col or i == n_pts - 1:
-                fig.add_trace(go.Scatter(
-                    x=seg_x, y=seg_y, mode='lines',
-                    line=dict(color=prev_col, width=2.5),
-                    showlegend=False, hoverinfo='skip',
-                ))
-                seg_x, seg_y = [x_vals[i]], [dynamic_prices[i]]
-                prev_col = pt_colors[i]
-
-        # Invisible scatter for hover tooltips
-        fig.add_trace(go.Scatter(
-            x=x_vals, y=list(dynamic_prices),
-            mode='markers', marker=dict(size=4, color=pt_colors, opacity=0.8),
-            customdata=t_labels,
-            hovertemplate='%{customdata}<br><b>%{y:.1f} €/MWh</b><extra></extra>',
-            showlegend=False,
-        ))
-
-        # Threshold lines
-        for lbl, _, mult, col in PRICE_STATES:
+        # Threshold reference lines (dotted, one per price state)
+        for _lbl, _, _mult, _col in PRICE_STATES:
             fig.add_hline(
-                y=BASE_PRICE * mult, line_dash='dot', line_color=col, line_width=1,
-                annotation_text=f'{lbl}  {BASE_PRICE*mult:.0f}€',
-                annotation_font_color=col, annotation_font_size=9,
+                y=BASE_PRICE * _mult, line_dash='dot', line_color=_col, line_width=0.8,
+                annotation_text=f'{_lbl} {BASE_PRICE*_mult:.0f}€',
+                annotation_font_color=_col, annotation_font_size=8,
                 annotation_position='right',
             )
 
-        y_max = max(max(dynamic_prices) * 1.15, BASE_PRICE * PRICE_STATES[2][2] * 1.1)
+        _y_max = max(max(_all_prices) * 1.15,
+                     max(s['base_price'] for s in STATIONS.values()) * PRICE_STATES[2][2] * 1.1)
         fig.update_layout(
-            height=220,
+            height=230,
             paper_bgcolor='#0d1520', plot_bgcolor='#0d1520',
-            margin=dict(l=50, r=95, t=10, b=35),
+            margin=dict(l=50, r=110, t=10, b=35),
             xaxis=dict(
-                tickmode='array', tickvals=x_vals[::20], ticktext=t_labels[::20],
                 tickfont=dict(color='#4a6070', size=9),
                 gridcolor='#1e2d3d', linecolor='#1e2d3d', zeroline=False, title=None,
             ),
@@ -680,352 +704,154 @@ with left_col:
                 title='€/MWh', tickfont=dict(color='#4a6070', size=9),
                 title_font=dict(color='#4a6070', size=9),
                 gridcolor='#1e2d3d', linecolor='#1e2d3d', zeroline=False,
-                range=[0, y_max],
+                range=[0, _y_max],
             ),
-            showlegend=False,
+            legend=dict(
+                orientation='h', yanchor='bottom', y=1.01, xanchor='left', x=0,
+                font=dict(color='#4a6070', size=9), bgcolor='rgba(0,0,0,0)',
+            ),
         )
-        st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+        st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False},
+                        key='price_sparkline')
     else:
         st.info("⏳ Waiting for dynamic price data…")
 
-    # ── Active charger count history ──────────────────────────────────────────
-    if active_chargers_hist and len(active_chargers_hist) > 1:
-        n_pts   = len(active_chargers_hist)
-        x_vals  = list(range(-n_pts + 1, 1))
-        t2_lbls = list(st.session_state['time_labels'])[-n_pts:]
-        t2_lbls = t2_lbls + [''] * (n_pts - len(t2_lbls))
-        fig2    = go.Figure()
-        fig2.add_trace(go.Scatter(
-            x=x_vals, y=list(active_chargers_hist),
-            mode='lines',
-            line=dict(color='#7c5cbf', width=1.5),
-            fill='tozeroy', fillcolor='rgba(124,92,191,0.06)',
-            customdata=t2_lbls,
-            hovertemplate='Time: %{customdata}<br>%{y} chargers active<extra></extra>',
-        ))
+    # ── Active charger count history — per station ────────────────────────────
+    _stn_chg_hist = st.session_state.get('station_charger_histories', {})
+    _t_lbls2      = list(st.session_state['time_labels'])
+    if any(len(v) > 1 for v in _stn_chg_hist.values()):
+        fig2 = go.Figure()
+        for _i, (_sid, _stn_cfg) in enumerate(STATIONS.items()):
+            _chist = _stn_chg_hist.get(_sid, [])
+            if len(_chist) < 2:
+                continue
+            _col  = _STN_LINE_COLS[_i % len(_STN_LINE_COLS)]
+            _n    = len(_chist)
+            _xs   = list(range(-_n + 1, 1))
+            _tlbs = _t_lbls2[-_n:] + [''] * max(0, _n - len(_t_lbls2))
+            fig2.add_trace(go.Scatter(
+                x=_xs, y=_chist,
+                mode='lines',
+                name=f"{_stn_cfg['name']} (cap {_stn_cfg['capacity']})",
+                line=dict(color=_col, width=1.5),
+                customdata=_tlbs,
+                hovertemplate=(f"<b>{_stn_cfg['name']}</b><br>"
+                               f"%{{customdata}}<br>%{{y}} / {_stn_cfg['capacity']} chargers"
+                               f"<extra></extra>"),
+            ))
+        # Capacity reference lines per station
+        for _i, (_sid, _stn_cfg) in enumerate(STATIONS.items()):
+            _col = _STN_LINE_COLS[_i % len(_STN_LINE_COLS)]
+            fig2.add_hline(y=_stn_cfg['capacity'], line_dash='dot',
+                           line_color=_col, line_width=0.6, opacity=0.4)
         fig2.update_layout(
-            height=100,
+            height=120,
             paper_bgcolor='#0d1520', plot_bgcolor='#0d1520',
-            margin=dict(l=50, r=90, t=5, b=30),
-            xaxis=dict(
-                tickmode='array', tickvals=x_vals[::20], ticktext=t2_lbls[::20],
-                tickfont=dict(color='#4a6070', size=9), gridcolor='#1e2d3d', linecolor='#1e2d3d', zeroline=False, title=None
-            ),
+            margin=dict(l=50, r=10, t=5, b=30),
+            xaxis=dict(tickfont=dict(color='#4a6070', size=9),
+                       gridcolor='#1e2d3d', linecolor='#1e2d3d',
+                       zeroline=False, title=None),
             yaxis=dict(
-                title='Chargers',
+                title='Chargers busy',
                 tickfont=dict(color='#4a6070', size=9),
                 title_font=dict(color='#4a6070', size=9),
                 gridcolor='#1e2d3d', linecolor='#1e2d3d',
                 zeroline=False,
-                range=[0, STATION_CAPACITY + 0.5],
+                range=[0, max(s['capacity'] for s in STATIONS.values()) + 0.5],
                 dtick=1,
             ),
-            showlegend=False,
+            legend=dict(orientation='h', yanchor='bottom', y=1.01, xanchor='left', x=0,
+                        font=dict(color='#4a6070', size=8), bgcolor='rgba(0,0,0,0)'),
         )
-        st.plotly_chart(fig2, use_container_width=True, config={'displayModeBar': False})
+        st.plotly_chart(fig2, use_container_width=True, config={'displayModeBar': False},
+                        key='charger_history')
 
-    # ── Price ladder ──────────────────────────────────────────────────────────
-    st.markdown('<div class="section-hdr">Price Ladder — Occupancy Impact</div>', unsafe_allow_html=True)
+    # ── Learned Hourly Profile — per station ─────────────────────────────────
+    st.markdown('<div class="section-hdr">What the Model Learned — Peak Frequency by Hour</div>',
+                unsafe_allow_html=True)
 
-    current_ratio   = (current_chargers or 0) / STATION_CAPACITY
-    peak_price      = BASE_PRICE * PRICE_STATES[-1][2]   # 90 EUR/MWh
+    _stn_profiles = st.session_state.get('station_hourly_profiles', {})
+    _prof_tabs    = st.tabs([f"{cfg['name']} ({sid.replace('station_','')})"
+                             for sid, cfg in STATIONS.items()])
 
-    ladder_html = '<div style="display:flex;flex-direction:column;gap:4px">'
-    for state_label, upper, mult, col in PRICE_STATES:
-        ref_p     = BASE_PRICE * mult
-        is_active = (
-            (state_label == 'Off-peak' and current_ratio <= PRICE_STATES[0][1]) or
-            (state_label == 'Normal'   and PRICE_STATES[0][1] < current_ratio <= PRICE_STATES[1][1]) or
-            (state_label == 'Peak'     and current_ratio > PRICE_STATES[1][1])
-        )
-        fill_pct  = int(ref_p / peak_price * 100)
-        outline   = f'border:1px solid {col}60;' if is_active else 'border:1px solid #0f1f30;'
-        bg_active = f'background:#0d1520;{outline}' if is_active else 'background:#080f1a;border:1px solid #0f1f30;'
-        occ_range = ('0–30%' if state_label == 'Off-peak' else
-                     '31–60%' if state_label == 'Normal' else '61–100%')
-        row_label = f'{"▶ " if is_active else ""}{state_label}  ({occ_range} occupied)'
-        shadow    = f'box-shadow:0 0 12px {col}30;' if is_active else ''
+    _cur_hour_idx = (st.session_state.get('last_snapshot_day', 48) * 15) // 60 % 24
+    _off_m = PRICE_STATES[0][2]
+    _peak_m = PRICE_STATES[2][2]
+    _hours   = list(range(24))
+    _h_labels = [f'{h:02d}:00' for h in _hours]
 
-        ladder_html += f'''
-        <div style="{bg_active}{shadow}border-radius:8px;padding:0.45rem 0.8rem;display:flex;align-items:center;gap:12px;transition:all 0.3s ease">
-          <div style="font-family:JetBrains Mono,monospace;font-size:0.65rem;color:{"#e2eaf4" if is_active else "#4a6070"};width:200px;flex-shrink:0">{row_label}</div>
-          <div style="flex:1;height:6px;background:#0a1525;border-radius:3px;overflow:hidden">
-            <div style="width:{fill_pct}%;height:100%;background:{col};border-radius:3px;{"animation:batt-shimmer 2s linear infinite;background-size:200% auto;" if is_active else ""}"></div>
-          </div>
-          <div style="font-family:JetBrains Mono,monospace;font-size:0.75rem;color:{col};width:80px;text-align:right;flex-shrink:0">{ref_p:.1f} €/MWh</div>
-        </div>'''
-    ladder_html += '</div>'
-    st.markdown(ladder_html, unsafe_allow_html=True)
+    for _tab, (_sid, _stn_cfg) in zip(_prof_tabs, STATIONS.items()):
+        with _tab:
+            _profile = _stn_profiles.get(_sid, {})
+            _base    = _stn_cfg['base_price']
+            _peak_freqs, _bar_colors, _obs_counts, _hist_prices = [], [], [], []
+            for h in _hours:
+                _p   = _profile.get(str(h), {})
+                _tot = _p.get('total_count', 0)
+                _pk  = _p.get('peak_count', 0)
+                _obs_counts.append(_tot)
+                if _tot >= 4:
+                    _freq = _pk / _tot
+                    _hp   = _base * (_off_m + (_peak_m - _off_m) * _freq)
+                else:
+                    _freq = None
+                    _hp   = None
+                _peak_freqs.append(_freq)
+                _hist_prices.append(_hp)
+                if _freq is None:
+                    _bar_colors.append('#1a2d44')
+                elif _freq >= 0.6:
+                    _bar_colors.append('#ff4b4b')
+                elif _freq >= 0.25:
+                    _bar_colors.append('#fed330')
+                else:
+                    _bar_colors.append('#26de81')
 
-    # ── Full-day price profile (multi-day) ────────────────────────────────────
-    st.markdown('<div class="section-hdr">Daily Price Profile — All Day</div>', unsafe_allow_html=True)
-
-    projected = st.session_state.get('projected_prices', [])
-    day_snaps = st.session_state.get('price_day_snapshots', [])
-
-    # Build x-axis: slot 0..95 → "HH:MM"
-    slot_labels = [f"{(s*15)//60:02d}:{(s*15)%60:02d}" for s in range(96)]
-
-    fig_day = go.Figure()
-    day_colors = ['#7c5cbf', '#ff9800', '#26de81']   # purple, orange, green — all visible on dark bg
-    for i, snap in enumerate(day_snaps):
-        fig_day.add_trace(go.Scatter(
-            x=slot_labels, y=snap['prices'],
-            mode='lines',
-            line=dict(color=day_colors[i % len(day_colors)], width=1.5, dash='dot'),
-            name=snap['label'],
-            opacity=0.8,
-            hovertemplate='%{x}<br>%{y:.1f} €/MWh<extra></extra>',
-        ))
-    if projected and len(projected) == 96:
-        fig_day.add_trace(go.Scatter(
-            x=slot_labels, y=projected,
-            mode='lines',
-            line=dict(color='#00e5ff', width=2),
-            fill='tozeroy', fillcolor='rgba(0,229,255,0.04)',
-            name='Today',
-            hovertemplate='%{x}<br>%{y:.1f} €/MWh<extra></extra>',
-        ))
-    elif not projected and not day_snaps:
-        # Show static reference when no live data yet
-        static_y = []
-        for s in range(96):
-            h = (s * 15) // 60
-            # Simulate a typical day: off-peak night, peak morning/evening
-            if 7 <= h <= 9 or 17 <= h <= 20:
-                static_y.append(BASE_PRICE * 1.8)
-            elif 10 <= h <= 16:
-                static_y.append(BASE_PRICE * 1.0)
-            else:
-                static_y.append(BASE_PRICE * 0.6)
-        fig_day.add_trace(go.Scatter(
-            x=slot_labels, y=static_y,
-            mode='lines',
-            line=dict(color='#2d4a62', width=1.5, dash='dot'),
-            name='Typical (demo)',
-            hovertemplate='%{x}<br>%{y:.1f} €/MWh<extra></extra>',
-        ))
-
-    # Add price state bands as horizontal lines
-    for lbl, _, mult, col in PRICE_STATES:
-        fig_day.add_hline(
-            y=BASE_PRICE * mult, line_dash='dot', line_color=col, line_width=0.5,
-            annotation_text=f'{lbl}', annotation_font_color=col, annotation_font_size=8,
-            annotation_position='right',
-        )
-    # Mark current time slot
-    cur_idx = st.session_state.get('last_snapshot_day', -1)
-    if 0 <= cur_idx < 96:
-        fig_day.add_vline(
-            x=slot_labels[cur_idx], line_dash='solid', line_color='rgba(255,255,255,0.18)', line_width=1,
-        )
-    fig_day.update_layout(
-        height=210,
-        paper_bgcolor='#0d1520', plot_bgcolor='#0d1520',
-        margin=dict(l=50, r=90, t=10, b=35),
-        xaxis=dict(
-            tickmode='array',
-            tickvals=slot_labels[::8],   # every 2 hours
-            ticktext=slot_labels[::8],
-            tickfont=dict(color='#4a6070', size=8),
-            gridcolor='#1e2d3d', linecolor='#1e2d3d', zeroline=False, title=None,
-        ),
-        yaxis=dict(
-            title='€/MWh', tickfont=dict(color='#4a6070', size=9),
-            title_font=dict(color='#4a6070', size=9),
-            gridcolor='#1e2d3d', linecolor='#1e2d3d', zeroline=False,
-            range=[0, BASE_PRICE * 2.2],
-        ),
-        legend=dict(
-            font=dict(color='#4a6070', size=8),
-            bgcolor='rgba(0,0,0,0)', x=0.01, y=0.99,
-        ),
-    )
-    st.plotly_chart(fig_day, use_container_width=True, config={'displayModeBar': False})
-
-    # ── Traffic → Price Impact ─────────────────────────────────────────────────
-    st.markdown('<div class="section-hdr">Traffic → Price Impact</div>', unsafe_allow_html=True)
-
-    charger_counts = list(range(STATION_CAPACITY + 1))
-    off_m, norm_m, peak_m = PRICE_STATES[0][2], PRICE_STATES[1][2], PRICE_STATES[2][2]
-
-    def _inst_price(n):
-        ratio = n / STATION_CAPACITY
-        for _, upper, mult, _ in PRICE_STATES:
-            if ratio <= upper:
-                return BASE_PRICE * mult
-        return BASE_PRICE * PRICE_STATES[-1][2]
-
-    # Blended price with different historic profiles
-    def _blended(n, peak_freq):
-        inst  = _inst_price(n)
-        hist  = BASE_PRICE * (off_m + (peak_m - off_m) * peak_freq)
-        return inst * 0.6 + hist * 0.4
-
-    y_instant  = [_inst_price(n) for n in charger_counts]
-    y_low_hist = [_blended(n, 0.1) for n in charger_counts]   # quiet history
-    y_high_hist= [_blended(n, 0.8) for n in charger_counts]   # busy history
-
-    # Get current blended price data from live hourly profile if available
-    profile = st.session_state.get('hourly_profile', {})
-    cur_hour = (st.session_state.get('last_snapshot_day', 48) * 15) // 60
-    cur_prof = profile.get(str(cur_hour), {})
-    cur_total= cur_prof.get('total_count', 0)
-    cur_peak = cur_prof.get('peak_count', 0)
-    cur_freq = (cur_peak / cur_total) if cur_total >= 4 else None
-    y_live   = [_blended(n, cur_freq) for n in charger_counts] if cur_freq is not None else None
-
-    fig_impact = go.Figure()
-    fig_impact.add_trace(go.Scatter(
-        x=charger_counts, y=y_high_hist,
-        mode='lines', line=dict(color='#ff4b4b', width=1, dash='dot'),
-        fill='tonexty', fillcolor='rgba(255,75,75,0.05)',
-        name='Busy history (80% peak)', hovertemplate='%{x} chargers → %{y:.1f} €<extra></extra>',
-    ))
-    fig_impact.add_trace(go.Scatter(
-        x=charger_counts, y=y_low_hist,
-        mode='lines', line=dict(color='#26de81', width=1, dash='dot'),
-        name='Quiet history (10% peak)', hovertemplate='%{x} chargers → %{y:.1f} €<extra></extra>',
-    ))
-    fig_impact.add_trace(go.Scatter(
-        x=charger_counts, y=y_instant,
-        mode='lines+markers',
-        line=dict(color='#00e5ff', width=2.5),
-        marker=dict(size=7, color='#00e5ff'),
-        name='Instantaneous (no history)', hovertemplate='%{x} chargers → %{y:.1f} €<extra></extra>',
-    ))
-    if y_live:
-        fig_impact.add_trace(go.Scatter(
-            x=charger_counts, y=y_live,
-            mode='lines+markers',
-            line=dict(color='#fed330', width=2),
-            marker=dict(size=6, color='#fed330'),
-            name=f'Live blended (hour {cur_hour:02d}:xx)', hovertemplate='%{x} chargers → %{y:.1f} €<extra></extra>',
-        ))
-    # Mark current charger count
-    cur_n = current_chargers or 0
-    fig_impact.add_vline(
-        x=cur_n, line_dash='solid', line_color='rgba(255,255,255,0.15)', line_width=1.5,
-        annotation_text=f'Now ({cur_n})', annotation_font_color='#4a6070', annotation_font_size=8,
-    )
-    fig_impact.update_layout(
-        height=210,
-        paper_bgcolor='#0d1520', plot_bgcolor='#0d1520',
-        margin=dict(l=50, r=10, t=10, b=35),
-        xaxis=dict(
-            title='Active chargers', tickfont=dict(color='#4a6070', size=9),
-            title_font=dict(color='#4a6070', size=9),
-            gridcolor='#1e2d3d', linecolor='#1e2d3d', zeroline=False,
-            tickvals=charger_counts, dtick=1,
-        ),
-        yaxis=dict(
-            title='€/MWh', tickfont=dict(color='#4a6070', size=9),
-            title_font=dict(color='#4a6070', size=9),
-            gridcolor='#1e2d3d', linecolor='#1e2d3d', zeroline=False,
-            range=[0, BASE_PRICE * 2.2],
-        ),
-        legend=dict(
-            font=dict(color='#4a6070', size=8),
-            bgcolor='rgba(0,0,0,0)', x=0.4, y=0.99,
-        ),
-    )
-    st.plotly_chart(fig_impact, use_container_width=True, config={'displayModeBar': False})
-
-    # ── Learned Hourly Profile ────────────────────────────────────────────────
-    st.markdown('<div class="section-hdr">What the Model Learned — Peak Frequency by Hour</div>', unsafe_allow_html=True)
-
-    profile = st.session_state.get('hourly_profile', {})
-    hours   = list(range(24))
-    h_labels= [f'{h:02d}:00' for h in hours]
-
-    peak_freqs  = []
-    hist_prices = []
-    bar_colors  = []
-    obs_counts  = []
-    off_m = PRICE_STATES[0][2]
-    peak_m= PRICE_STATES[2][2]
-
-    for h in hours:
-        p   = profile.get(str(h), {})
-        tot = p.get('total_count', 0)
-        pk  = p.get('peak_count',  0)
-        obs_counts.append(tot)
-        if tot >= 4:
-            freq = pk / tot
-            hp   = BASE_PRICE * (off_m + (peak_m - off_m) * freq)
-        else:
-            freq = None
-            hp   = None
-        peak_freqs.append(freq)
-        hist_prices.append(hp)
-        if freq is None:
-            bar_colors.append('#1a2d44')          # no data yet — dark placeholder
-        elif freq >= 0.6:
-            bar_colors.append('#ff4b4b')          # mostly peak
-        elif freq >= 0.25:
-            bar_colors.append('#fed330')          # mixed
-        else:
-            bar_colors.append('#26de81')          # mostly off-peak
-
-    fig_profile = go.Figure()
-
-    # Bar: peak frequency per hour
-    fig_profile.add_trace(go.Bar(
-        x=h_labels,
-        y=[f if f is not None else 0 for f in peak_freqs],
-        marker_color=bar_colors,
-        name='Peak frequency',
-        customdata=[(obs_counts[i], hist_prices[i] or 0) for i in hours],
-        hovertemplate=(
-            '<b>%{x}</b><br>'
-            'Peak frequency: %{y:.0%}<br>'
-            'Learned price: %{customdata[1]:.1f} €/MWh<br>'
-            'Observations: %{customdata[0]}<extra></extra>'
-        ),
-    ))
-
-    # Mark current hour (use numeric index — add_vline needs int on categorical axes)
-    cur_h_idx = cur_hour % 24
-    fig_profile.add_vline(
-        x=cur_h_idx,
-        line_dash='solid', line_color='rgba(255,255,255,0.3)', line_width=1.5,
-        annotation_text='Now', annotation_font_color='#e2eaf4', annotation_font_size=9,
-    )
-
-    # Threshold lines at 25% and 60% peak frequency
-    fig_profile.add_hline(y=0.6,  line_dash='dot', line_color='#ff4b4b', line_width=0.8,
-                          annotation_text='→ Peak price zone',  annotation_font_color='#ff4b4b', annotation_font_size=8, annotation_position='right')
-    fig_profile.add_hline(y=0.25, line_dash='dot', line_color='#fed330', line_width=0.8,
-                          annotation_text='→ Normal price zone', annotation_font_color='#fed330', annotation_font_size=8, annotation_position='right')
-
-    fig_profile.update_layout(
-        height=200,
-        paper_bgcolor='#0d1520', plot_bgcolor='#0d1520',
-        margin=dict(l=50, r=110, t=10, b=40),
-        xaxis=dict(
-            tickfont=dict(color='#4a6070', size=8), tickangle=-45,
-            gridcolor='#1e2d3d', linecolor='#1e2d3d', zeroline=False, title=None,
-        ),
-        yaxis=dict(
-            title='% of time at peak', tickformat='.0%',
-            tickfont=dict(color='#4a6070', size=9),
-            title_font=dict(color='#4a6070', size=9),
-            gridcolor='#1e2d3d', linecolor='#1e2d3d', zeroline=False,
-            range=[0, 1.05],
-        ),
-        showlegend=False,
-        bargap=0.15,
-    )
-    # Caption explaining what this shows
-    st.plotly_chart(fig_profile, use_container_width=True, config={'displayModeBar': False})
-    st.markdown(
-        '<div style="font-family:JetBrains Mono,monospace;font-size:0.58rem;color:#2d4a62;margin-top:-0.5rem">'
-        'Each bar = % of observations at that hour that were PEAK (4–5 chargers busy). '
-        'Dark bars = not enough data yet. '
-        'This drives the 40% predictive component — price rises for busy hours even before traffic arrives.'
-        '</div>',
-        unsafe_allow_html=True,
-    )
+            _fig_p = go.Figure()
+            _fig_p.add_trace(go.Bar(
+                x=_h_labels,
+                y=[f if f is not None else 0 for f in _peak_freqs],
+                marker_color=_bar_colors,
+                customdata=[(_obs_counts[i], _hist_prices[i] or 0) for i in _hours],
+                hovertemplate=(
+                    '<b>%{x}</b><br>'
+                    'Peak freq: %{y:.0%}<br>'
+                    'Learned price: %{customdata[1]:.1f} €/MWh<br>'
+                    'Observations: %{customdata[0]}<extra></extra>'
+                ),
+            ))
+            _fig_p.add_vline(x=_cur_hour_idx,
+                             line_dash='solid', line_color='rgba(255,255,255,0.3)', line_width=1.5,
+                             annotation_text='Now', annotation_font_color='#e2eaf4',
+                             annotation_font_size=9)
+            _fig_p.add_hline(y=0.6,  line_dash='dot', line_color='#ff4b4b', line_width=0.8,
+                             annotation_text='→ Peak',   annotation_font_color='#ff4b4b',
+                             annotation_font_size=8, annotation_position='right')
+            _fig_p.add_hline(y=0.25, line_dash='dot', line_color='#fed330', line_width=0.8,
+                             annotation_text='→ Normal', annotation_font_color='#fed330',
+                             annotation_font_size=8, annotation_position='right')
+            _fig_p.update_layout(
+                height=190,
+                paper_bgcolor='#0d1520', plot_bgcolor='#0d1520',
+                margin=dict(l=50, r=90, t=8, b=38),
+                xaxis=dict(tickfont=dict(color='#4a6070', size=8), tickangle=-45,
+                           gridcolor='#1e2d3d', linecolor='#1e2d3d', zeroline=False, title=None),
+                yaxis=dict(title='% peak', tickformat='.0%',
+                           tickfont=dict(color='#4a6070', size=9),
+                           title_font=dict(color='#4a6070', size=9),
+                           gridcolor='#1e2d3d', linecolor='#1e2d3d', zeroline=False,
+                           range=[0, 1.05]),
+                showlegend=False, bargap=0.15,
+            )
+            st.plotly_chart(_fig_p, use_container_width=True, config={'displayModeBar': False},
+                            key=f'peak_freq_{_sid}')
+            st.markdown(
+                f'<div style="font-family:JetBrains Mono,monospace;font-size:0.57rem;color:#2d4a62;'
+                f'margin-top:-0.4rem">Base {_base:.0f} €/MWh · '
+                f'Peak threshold {_base*_peak_m:.0f} €/MWh · '
+                f'Drives the 40 % predictive pricing component for {_stn_cfg["name"]}.</div>',
+                unsafe_allow_html=True,
+            )
 
     # ── Bidding decision legend ───────────────────────────────────────────────
     st.markdown("""
@@ -1062,73 +888,201 @@ with left_col:
     soc_html += '</div>'
     st.markdown(soc_html, unsafe_allow_html=True)
 
-    # ── Reservation Slots Table ────────────────────────────────────────────────
+    # ── Reservation Board — grouped per station ───────────────────────────────
     st.markdown('<div class="section-hdr">Reservation Board</div>', unsafe_allow_html=True)
 
-    if _car_res_active:
-        schedule = charger_schedule
-        all_slots = sorted({s for charger in schedule for s in charger})
+    _car_stations_res = st.session_state.get('car_stations', {})
+    _charger_colors   = ['#00e5ff', '#26de81', '#fed330', '#ff9800', '#7c5cbf']
+    _any_reservations = False
 
-        # Charger colors
-        charger_colors = ['#00e5ff', '#26de81', '#fed330', '#ff9800', '#7c5cbf']
+    for _sid, _stn_cfg in STATIONS.items():
+        _stn_cap  = _stn_cfg['capacity']
+        _stn_name = _stn_cfg['name']
 
-        tbl = '<div style="overflow-x:auto;margin-bottom:0.5rem">'
-        tbl += ('<table style="border-collapse:collapse;width:100%;font-family:JetBrains Mono,monospace;'
-                'font-size:0.58rem">')
+        # Cars with reservations assigned to this station
+        _stn_car_res = {
+            cid: slots for cid, slots in _car_res_active.items()
+            if _car_stations_res.get(cid) == _sid
+        }
+        if not _stn_car_res:
+            continue
+        _any_reservations = True
 
-        # Header row — time slots
+        # Build a charger schedule for just this station
+        _stn_schedule = [{} for _ in range(_stn_cap)]
+        _sorted_stn = sorted(_stn_car_res.items(), key=lambda x: (min(x[1]), x[0]))
+        for _cid, _slots in _sorted_stn:
+            _slots_set = set(_slots)
+            _best = None
+            for _ch in range(_stn_cap):
+                if not (_slots_set & set(_stn_schedule[_ch].keys())):
+                    _best = _ch
+                    break
+            if _best is not None:
+                for _s in _slots:
+                    _stn_schedule[_best][_s] = _cid
+            else:
+                for _s in _slots:
+                    for _ch in range(_stn_cap):
+                        if _s not in _stn_schedule[_ch]:
+                            _stn_schedule[_ch][_s] = _cid
+                            break
+
+        _all_slots = sorted({s for ch in _stn_schedule for s in ch})
+        _sd        = station_data.get(_sid, {})
+        _sp        = _sd.get('current_price', _stn_cfg['base_price'])
+        _pc        = ('#ff4b4b' if _sp > _stn_cfg['base_price'] * 1.4
+                      else '#26de81' if _sp <= _stn_cfg['base_price'] * 1.05
+                      else '#fed330')
+
+        tbl  = (f'<div style="font-family:JetBrains Mono,monospace;font-size:0.55rem;'
+                f'color:{_pc};letter-spacing:0.1em;margin:0.6rem 0 0.25rem">'
+                f'⚡ {_sid.upper().replace("_"," ")} — {_stn_name.upper()} '
+                f'({_sp:.1f} €/MWh · {_stn_cap} chargers)</div>')
+        tbl += '<div style="overflow-x:auto;margin-bottom:0.5rem">'
+        tbl += ('<table style="border-collapse:collapse;width:100%;font-family:JetBrains Mono,'
+                'monospace;font-size:0.58rem">')
+
+        # Header — time slots
         tbl += ('<tr><td style="padding:4px 8px;color:#2d4a62;border-bottom:1px solid #0f1f30;'
                 'position:sticky;left:0;background:#060b14;z-index:1;min-width:80px">CHARGER</td>')
-        for s in all_slots:
-            h, m = (s * 15) // 60, (s * 15) % 60
+        for _s in _all_slots:
+            _sh, _sm = (_s * 15) // 60, (_s * 15) % 60
             tbl += (f'<td style="padding:4px 5px;color:#2d4a62;border-bottom:1px solid #0f1f30;'
-                    f'text-align:center;white-space:nowrap">{h:02d}:{m:02d}</td>')
+                    f'text-align:center;white-space:nowrap">{_sh:02d}:{_sm:02d}</td>')
         tbl += '</tr>'
 
-        # One row per charger (1..5)
-        for ch in range(STATION_CAPACITY):
-            ch_color = charger_colors[ch % len(charger_colors)]
-            tbl += (f'<tr><td style="padding:4px 8px;color:{ch_color};border-bottom:1px solid #0f1f30;'
+        # One row per charger
+        for _ch in range(_stn_cap):
+            _ch_col = _charger_colors[_ch % len(_charger_colors)]
+            tbl += (f'<tr><td style="padding:4px 8px;color:{_ch_col};border-bottom:1px solid #0f1f30;'
                     f'position:sticky;left:0;background:#060b14;z-index:1;white-space:nowrap">'
-                    f'&#9889; CHARGER {ch + 1}</td>')
-            for s in all_slots:
-                cid = schedule[ch].get(s)
-                if cid is not None:
-                    short = cid.upper().replace('CAR_', 'C')
-                    # Color cell by car SOC
-                    cd = st.session_state['cars'].get(cid, {})
-                    soc = float(cd.get('current_soc', 0.5))
-                    sc = soc_color(soc)
+                    f'&#9889; CHARGER {_ch + 1}</td>')
+            for _s in _all_slots:
+                _cid = _stn_schedule[_ch].get(_s)
+                if _cid is not None:
+                    _short = _cid.upper().replace('CAR_', 'C')
+                    _cd    = st.session_state['cars'].get(_cid, {})
+                    _soc   = float(_cd.get('current_soc', 0.5))
+                    _sc    = soc_color(_soc)
                     tbl += (f'<td style="padding:3px 4px;text-align:center;border-bottom:1px solid #0f1f30;'
-                            f'background:{sc}12;color:{sc};white-space:nowrap" '
-                            f'title="{cid} — SOC {soc*100:.0f}%">{short}</td>')
+                            f'background:rgba(0,0,0,0.2);color:{_sc};white-space:nowrap" '
+                            f'title="{_cid} — SOC {_soc*100:.0f}%">{_short}</td>')
                 else:
                     tbl += (f'<td style="padding:3px 4px;text-align:center;border-bottom:1px solid #0f1f30;'
                             f'color:#0f1f30">-</td>')
             tbl += '</tr>'
 
-        # Utilization row — how many chargers busy per slot
+        # Load row
         tbl += ('<tr><td style="padding:4px 8px;color:#4a6070;border-top:1px solid #1a2d44;'
                 'position:sticky;left:0;background:#060b14;z-index:1;font-weight:500">LOAD</td>')
-        for s in all_slots:
-            count = sum(1 for ch in range(STATION_CAPACITY) if s in schedule[ch])
-            pct = int(count / STATION_CAPACITY * 100)
-            bar_color = '#26de81' if count <= 2 else '#fed330' if count <= 4 else '#ff4b4b'
+        for _s in _all_slots:
+            _cnt = sum(1 for _ch in range(_stn_cap) if _s in _stn_schedule[_ch])
+            _pct = int(_cnt / _stn_cap * 100)
+            _bc  = '#26de81' if _cnt / _stn_cap <= 0.4 else '#fed330' if _cnt / _stn_cap <= 0.8 else '#ff4b4b'
             tbl += (f'<td style="padding:3px 4px;text-align:center;border-top:1px solid #1a2d44">'
-                    f'<div style="color:{bar_color};font-weight:500;margin-bottom:2px">{count}/{STATION_CAPACITY}</div>'
+                    f'<div style="color:{_bc};font-weight:500;margin-bottom:2px">{_cnt}/{_stn_cap}</div>'
                     f'<div style="height:3px;background:#0a1525;border-radius:2px;overflow:hidden">'
-                    f'<div style="height:100%;width:{pct}%;background:{bar_color};border-radius:2px"></div>'
+                    f'<div style="height:100%;width:{_pct}%;background:{_bc};border-radius:2px"></div>'
                     f'</div></td>')
-        tbl += '</tr>'
-
-        tbl += '</table></div>'
+        tbl += '</tr></table></div>'
         st.markdown(tbl, unsafe_allow_html=True)
-    else:
+
+    if not _any_reservations:
         st.markdown(
             '<div style="font-family:JetBrains Mono,monospace;font-size:0.65rem;color:#2d4a62;'
             'padding:0.8rem;background:#080f1a;border:1px solid #0f1f30;border-radius:8px;'
             'text-align:center">No active reservations</div>',
             unsafe_allow_html=True)
+
+
+    # ── 2D Fleet Grid Map ─────────────────────────────────────────────────────
+    st.markdown('<div class="section-hdr">Fleet Grid Map</div>', unsafe_allow_html=True)
+
+    _car_stations = st.session_state.get('car_stations', {})
+    _all_cars = st.session_state.get('cars', {})
+
+    # Car scatter data
+    _cx, _cy, _csoc, _cid_list, _ccol, _ctext = [], [], [], [], [], []
+    for _cid, _cd in _all_cars.items():
+        _cx.append(_cd.get('x', 5.0))
+        _cy.append(_cd.get('y', 5.0))
+        _soc_v = _cd.get('current_soc', 0.5)
+        _csoc.append(_soc_v * 100)
+        _cid_list.append(_cid)
+        _ccol.append(soc_color(_soc_v))
+        _ctext.append(f"{_cid} — SOC {_soc_v*100:.0f}%")
+
+    fig_map = go.Figure()
+
+    # Merge all travel lines into ONE trace (None separators = disconnected segments).
+    # A fixed trace count avoids Streamlit re-rendering the whole chart when charger
+    # count changes between ticks, which was causing the double-map ghost.
+    _line_x, _line_y = [], []
+    for _cid, _sid in _car_stations.items():
+        _cd  = _all_cars.get(_cid, {})
+        _stn = STATIONS.get(_sid, {})
+        if _cd and _stn and _cd.get('plugged_in'):
+            _line_x += [_cd.get('x', 5.0), _stn['x'], None]
+            _line_y += [_cd.get('y', 5.0), _stn['y'], None]
+    fig_map.add_trace(go.Scatter(
+        x=_line_x, y=_line_y,
+        mode='lines',
+        line=dict(color='rgba(0,229,255,0.13)', width=1),
+        hoverinfo='skip',
+        showlegend=False,
+    ))
+
+    # Car dots
+    fig_map.add_trace(go.Scatter(
+        x=_cx, y=_cy,
+        mode='markers',
+        marker=dict(
+            size=7,
+            color=_csoc,
+            colorscale=[[0,'#ff4b4b'],[0.15,'#ff4b4b'],[0.4,'#fed330'],[0.75,'#26de81'],[1.0,'#00e5ff']],
+            cmin=0, cmax=100,
+            line=dict(width=0.5, color='#1a2d44'),
+        ),
+        text=_ctext,
+        hovertemplate='%{text}<extra></extra>',
+        name='Cars',
+        showlegend=False,
+    ))
+
+    # Station markers
+    _STN_COLORS = ['#00e5ff', '#26de81', '#fed330']
+    for _i, (sid, stn) in enumerate(STATIONS.items()):
+        _sd   = station_data.get(sid, {})
+        _sa   = _sd.get('active_chargers', 0)
+        _cap  = stn['capacity']
+        _sc   = occupancy_color(_sa, _cap)
+        _sp   = _sd.get('current_price', stn['base_price'])
+        fig_map.add_trace(go.Scatter(
+            x=[stn['x']], y=[stn['y']],
+            mode='markers+text',
+            marker=dict(size=18, color=_sc, symbol='square', line=dict(width=2, color='#060b14')),
+            text=[stn['name']],
+            textposition='top center',
+            textfont=dict(color='#e2eaf4', size=9, family='JetBrains Mono'),
+            hovertemplate=f"{sid}<br>{stn['name']}<br>Price: {_sp:.1f} €/MWh<br>Chargers: {_sa}/{_cap}<extra></extra>",
+            name=stn['name'],
+            showlegend=False,
+        ))
+
+    fig_map.update_layout(
+        height=280,
+        paper_bgcolor='#0d1520', plot_bgcolor='#0d1520',
+        margin=dict(l=20, r=20, t=10, b=20),
+        xaxis=dict(range=[-0.5, 10.5], gridcolor='#1e2d3d', zeroline=False,
+                   tickfont=dict(color='#4a6070', size=8), title='km'),
+        yaxis=dict(range=[-0.5, 10.5], gridcolor='#1e2d3d', zeroline=False,
+                   tickfont=dict(color='#4a6070', size=8), title='km',
+                   scaleanchor='x', scaleratio=1),
+    )
+    st.plotly_chart(fig_map, use_container_width=True, config={'displayModeBar': False},
+                    key='fleet_grid_map')
+
 
 
 # ═══════════════════════════════════════════════
@@ -1155,38 +1109,167 @@ with right_col:
                     _charger_to_car[_ch] = cid
                     break
 
-    _station_html = '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:1rem">'
-    for _slot in range(STATION_CAPACITY):
-        if _slot in _charger_to_car:
-            _cid   = _charger_to_car[_slot]
-            _soc   = float(cars[_cid].get('current_soc', 0.0)) * 100
-            _label = _cid.upper().replace('_', ' ')
-            _station_html += f'''
-            <div style="flex:1;min-width:70px;background:#080f1a;border:1px solid #00e5ff40;
-                        border-radius:10px;padding:0.6rem 0.5rem;text-align:center;
-                        box-shadow:0 0 10px #00e5ff18;animation:pulse-border 2.5s ease-in-out infinite">
-              <div style="font-size:1.3rem;margin-bottom:2px">⚡</div>
-              <div style="font-family:JetBrains Mono,monospace;font-size:0.6rem;color:#00e5ff;
-                          letter-spacing:0.08em;margin-bottom:4px">{_label}</div>
-              <div style="font-family:JetBrains Mono,monospace;font-size:1rem;color:#e2eaf4;
-                          font-weight:500">{_soc:.0f}<span style="font-size:0.65rem;color:#4a6070">%</span></div>
-              <div style="height:4px;background:#0a1525;border-radius:2px;margin-top:5px;overflow:hidden">
-                <div style="height:100%;width:{_soc:.0f}%;background:#00e5ff;border-radius:2px;
-                             background-size:200% auto;animation:batt-shimmer 2s linear infinite"></div>
-              </div>
-            </div>'''
-        else:
-            _station_html += f'''
-            <div style="flex:1;min-width:70px;background:#080f1a;border:1px solid #0f1f30;
-                        border-radius:10px;padding:0.6rem 0.5rem;text-align:center;opacity:0.5">
-              <div style="font-size:1.3rem;margin-bottom:2px;filter:grayscale(1)">🔌</div>
-              <div style="font-family:JetBrains Mono,monospace;font-size:0.6rem;color:#2d4a62;
-                          letter-spacing:0.08em;margin-bottom:4px">CHARGER {_slot + 1}</div>
-              <div style="font-family:JetBrains Mono,monospace;font-size:0.8rem;color:#2d4a62">FREE</div>
-              <div style="height:4px;background:#0a1525;border-radius:2px;margin-top:5px"></div>
-            </div>'''
-    _station_html += '</div>'
+    # Render one group of charger cards per station
+    _car_stations_map = st.session_state.get('car_stations', {})
+    _station_html = ''
+    for _sid, _stn_cfg in STATIONS.items():
+        _stn_cap  = _stn_cfg['capacity']
+        _stn_name = _stn_cfg['name']
+        _sd       = station_data.get(_sid, {})
+        _sp       = _sd.get('current_price', _stn_cfg['base_price'])
+        _price_col = ('#ff4b4b' if _sp > _stn_cfg['base_price'] * 1.4
+                      else '#26de81' if _sp <= _stn_cfg['base_price'] * 1.05
+                      else '#fed330')
+        _station_html += (
+            f'<div style="font-family:JetBrains Mono,monospace;font-size:0.55rem;'
+            f'color:{_price_col};letter-spacing:0.1em;margin:0.5rem 0 0.3rem">'
+            f'⚡ {_sid.upper().replace("_"," ")} — {_stn_name.upper()} '
+            f'({_sp:.1f} €/MWh)</div>'
+        )
+        _station_html += '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:0.6rem">'
+        # Cars at this station that are currently plugged in
+        _at_this_stn = [cid for cid, s in _car_stations_map.items()
+                        if s == _sid and cars.get(cid, {}).get('plugged_in', False)]
+        for _slot in range(_stn_cap):
+            if _slot < len(_at_this_stn):
+                _cid  = _at_this_stn[_slot]
+                _soc  = float(cars[_cid].get('current_soc', 0.0)) * 100
+                _label = _cid.upper().replace('_', ' ')
+                _station_html += f'''
+                <div style="flex:1;min-width:70px;background:#080f1a;border:1px solid {_price_col}40;
+                            border-radius:10px;padding:0.6rem 0.5rem;text-align:center;
+                            box-shadow:0 0 10px {_price_col}18;animation:pulse-border 2.5s ease-in-out infinite">
+                  <div style="font-size:1.3rem;margin-bottom:2px">⚡</div>
+                  <div style="font-family:JetBrains Mono,monospace;font-size:0.6rem;color:{_price_col};
+                              letter-spacing:0.08em;margin-bottom:4px">{_label}</div>
+                  <div style="font-family:JetBrains Mono,monospace;font-size:1rem;color:#e2eaf4;
+                              font-weight:500">{_soc:.0f}<span style="font-size:0.65rem;color:#4a6070">%</span></div>
+                  <div style="height:4px;background:#0a1525;border-radius:2px;margin-top:5px;overflow:hidden">
+                    <div style="height:100%;width:{_soc:.0f}%;background:{_price_col};border-radius:2px;
+                                 background-size:200% auto;animation:batt-shimmer 2s linear infinite"></div>
+                  </div>
+                </div>'''
+            else:
+                _station_html += f'''
+                <div style="flex:1;min-width:70px;background:#080f1a;border:1px solid #0f1f30;
+                            border-radius:10px;padding:0.6rem 0.5rem;text-align:center;opacity:0.5">
+                  <div style="font-size:1.3rem;margin-bottom:2px;filter:grayscale(1)">🔌</div>
+                  <div style="font-family:JetBrains Mono,monospace;font-size:0.6rem;color:#2d4a62;
+                              letter-spacing:0.08em;margin-bottom:4px">SLOT {_slot + 1}</div>
+                  <div style="font-family:JetBrains Mono,monospace;font-size:0.8rem;color:#2d4a62">FREE</div>
+                  <div style="height:4px;background:#0a1525;border-radius:2px;margin-top:5px"></div>
+                </div>'''
+        _station_html += '</div>'
     st.markdown(_station_html, unsafe_allow_html=True)
+
+    # ── Routing Decision Matrix ───────────────────────────────────────────────
+    st.markdown('<div class="section-hdr">Routing Decision Matrix</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div style="font-family:JetBrains Mono,monospace;font-size:0.55rem;color:#2d4a62;'
+        'margin-bottom:0.5rem">For each assigned car: travel cost + charging cost per station. '
+        'The chosen station has the lowest total — showing why it beat cheaper-but-farther '
+        'or closer-but-pricier alternatives.</div>',
+        unsafe_allow_html=True)
+
+    _rdm_cars  = st.session_state.get('car_stations', {})      # car_id → station_id
+    _rdm_res   = st.session_state.get('car_reserved_slots', {})
+    _rdm_sdata = st.session_state.get('station_data', {})
+
+    # Only show cars that have an active assignment and reserved slots, sorted by SOC asc
+    _rdm_active = [
+        (cid, sid) for cid, sid in _rdm_cars.items()
+        if cid in cars and _rdm_res.get(cid)
+    ]
+    _rdm_active.sort(key=lambda x: cars.get(x[0], {}).get('current_soc', 1.0))
+
+    if _rdm_active:
+        _stn_ids   = list(STATIONS.keys())
+        _stn_short = {'station_A': 'Alpha', 'station_B': 'Beta', 'station_C': 'Gamma'}
+
+        rdm_html = '<div style="overflow-x:auto">'
+        # Table header
+        rdm_html += ('<table style="border-collapse:collapse;width:100%;font-family:JetBrains Mono,'
+                     'monospace;font-size:0.57rem;white-space:nowrap">')
+        rdm_html += '<tr style="color:#2d4a62;border-bottom:1px solid #0f1f30">'
+        rdm_html += '<td style="padding:3px 6px">CAR</td><td style="padding:3px 6px">SOC</td>'
+        for _sid in _stn_ids:
+            _scfg = STATIONS[_sid]
+            rdm_html += (f'<td colspan="3" style="padding:3px 8px;text-align:center;'
+                         f'border-left:1px solid #0f1f30">'
+                         f'{_scfg["name"].upper()} '
+                         f'<span style="color:#1a3048">({_scfg["base_price"]:.0f}€ base)</span>'
+                         f'</td>')
+        rdm_html += '</tr>'
+        # Sub-header
+        rdm_html += '<tr style="color:#1a3048;border-bottom:1px solid #0f1f30;font-size:0.5rem">'
+        rdm_html += '<td colspan="2"></td>'
+        for _sid in _stn_ids:
+            rdm_html += ('<td style="padding:2px 5px;border-left:1px solid #0f1f30;text-align:right">Travel€</td>'
+                         '<td style="padding:2px 5px;text-align:right">Charge€</td>'
+                         '<td style="padding:2px 5px;text-align:right;font-weight:600">Total€</td>')
+        rdm_html += '</tr>'
+
+        for _cid, _chosen_sid in _rdm_active[:20]:   # cap at 20 rows
+            _car   = cars.get(_cid, {})
+            _soc   = float(_car.get('current_soc', 0.5))
+            _cx    = float(_car.get('x', 5.0))
+            _cy    = float(_car.get('y', 5.0))
+            _slots = _rdm_res.get(_cid, [])
+            _n_slots = max(len(_slots), 1)
+            _soc_c = soc_color(_soc)
+            _label = _cid.upper().replace('CAR_', 'C')
+            _is_emg = st.session_state['car_decisions'].get(_cid) == 'EMERGENCY'
+
+            # Pre-compute costs for each station
+            _costs = {}
+            for _sid in _stn_ids:
+                _scfg  = STATIONS[_sid]
+                _dist  = math.sqrt((_cx - _scfg['x'])**2 + (_cy - _scfg['y'])**2)
+                _trav  = 2 * _dist * 0.2 * _scfg['base_price'] / 1000
+                _price = _rdm_sdata.get(_sid, {}).get('current_price', _scfg['base_price'])
+                _chg   = _n_slots * 2.75 * _price / 1000
+                _costs[_sid] = (_trav, _chg, _trav + _chg, _dist)
+
+            # Find cheapest total (what the algorithm would choose for normal cars)
+            _best_sid = min(_costs, key=lambda s: _costs[s][2])
+
+            rdm_html += f'<tr style="border-bottom:1px solid #0a1520">'
+            rdm_html += (f'<td style="padding:3px 6px;color:{_soc_c}">'
+                         f'{"⚠ " if _is_emg else ""}{_label}</td>')
+            rdm_html += (f'<td style="padding:3px 6px;color:{_soc_c};text-align:right">'
+                         f'{_soc*100:.0f}%</td>')
+
+            for _sid in _stn_ids:
+                _trav, _chg, _total, _dist = _costs[_sid]
+                _is_chosen = (_sid == _chosen_sid)
+                _is_best   = (_sid == _best_sid)
+                _cell_bg   = 'background:#0d1f10;' if _is_chosen else ''
+                _col       = '#26de81' if _is_chosen else '#4a6070'
+                _tick      = ' ✓' if _is_chosen else ''
+                rdm_html += (
+                    f'<td style="padding:3px 5px;border-left:1px solid #0f1f30;'
+                    f'text-align:right;color:#4a6070;{_cell_bg}">'
+                    f'<span title="{_dist:.1f} km">{_trav:.3f}</span></td>'
+                    f'<td style="padding:3px 5px;text-align:right;color:#4a6070;{_cell_bg}">'
+                    f'{_chg:.3f}</td>'
+                    f'<td style="padding:3px 5px;text-align:right;font-weight:600;'
+                    f'color:{_col};{_cell_bg}">{_total:.3f}{_tick}</td>'
+                )
+            rdm_html += '</tr>'
+
+        rdm_html += '</table></div>'
+        st.markdown(rdm_html, unsafe_allow_html=True)
+        st.markdown(
+            '<div style="font-family:JetBrains Mono,monospace;font-size:0.52rem;color:#1a3048;'
+            'margin-top:0.3rem">Travel€ = 2 × distance × 0.2kWh/km × base_price · '
+            'Charge€ = slots × 2.75kWh × live_price · ✓ = chosen station</div>',
+            unsafe_allow_html=True)
+    else:
+        st.markdown(
+            '<div style="font-family:JetBrains Mono,monospace;font-size:0.65rem;color:#2d4a62;'
+            'padding:0.6rem;background:#080f1a;border:1px solid #0f1f30;border-radius:8px;'
+            'text-align:center">No active routing decisions</div>',
+            unsafe_allow_html=True)
 
     # ── Fleet status (car cards) ──────────────────────────────────────────────
     st.markdown('<div class="section-hdr">Fleet Status</div>', unsafe_allow_html=True)
@@ -1215,6 +1298,14 @@ with right_col:
                 # Decision badge from latest Flink command
                 decision       = st.session_state['car_decisions'].get(car_id, 'IDLE')
                 badge_html, badge_cls = DECISION_BADGE.get(decision, ('&#9679; IDLE', 'badge-idle'))
+
+                # Station badge
+                _assigned_sid  = st.session_state.get('car_stations', {}).get(car_id)
+                _stn_name_short = STATIONS.get(_assigned_sid, {}).get('name', '')[:1] if _assigned_sid else ''
+                _stn_badge = (f'<span style="font-family:JetBrains Mono,monospace;font-size:0.5rem;'
+                              f'color:#7c5cbf;background:#7c5cbf18;border:1px solid #7c5cbf30;'
+                              f'border-radius:3px;padding:1px 4px;margin-right:4px">→{_stn_name_short}</span>'
+                              if _stn_name_short else '')
 
                 label      = car_id.upper().replace("_", " ")
                 border_col = ('#00e5ff30' if plugged else
@@ -1245,8 +1336,8 @@ with right_col:
                       # Priority
                       f'<div style="font-family:JetBrains Mono,monospace;font-size:0.6rem;'
                       f'color:#4a6070;width:28px;flex-shrink:0;text-align:center">P{priority}</div>'
-                      # Decision badge
-                      f'<div style="flex-shrink:0"><span class="badge {badge_cls}" '
+                      # Station badge + Decision badge
+                      f'<div style="flex-shrink:0">{_stn_badge}<span class="badge {badge_cls}" '
                       f'style="font-size:0.55rem;padding:0.15rem 0.45rem">{badge_html}</span></div>'
                     f'</div>'
                 )
