@@ -51,6 +51,7 @@ from fleet_graph import (
     get_reservation_summary,
 )
 from stations import STATIONS, projected_price_for_station
+from ai_scheduler import QLearningAgent
 
 import sys, os
 try:
@@ -95,6 +96,9 @@ class EVFleetProcessor(KeyedProcessFunction):
         # --- Per-car charging tracking ---
         self.was_charging = runtime_context.get_map_state(
             MapStateDescriptor("was_charging", Types.STRING(), Types.BOOLEAN()))
+
+        # --- Q-learning agent (always active — handles ai group cars) ---
+        self._q_agent = QLearningAgent()
 
         # --- Reservation board ---
         # key: "{station_id}:{slot_idx}"  →  value: JSON list of car_ids
@@ -213,6 +217,29 @@ class EVFleetProcessor(KeyedProcessFunction):
                 selected.append(slot)
         return selected
 
+    def _select_cheapest_slots_at_station(
+        self,
+        station_id: str,
+        current_idx: int,
+        num_needed: int,
+        station_res_counts: dict,
+    ) -> list:
+        """
+        Select the cheapest available future slots within a single pre-chosen
+        station. Used by the Q-learning agent after it picks a station.
+        """
+        counts   = station_res_counts.get(station_id, {})
+        capacity = STATIONS[station_id]['capacity']
+        candidates = []
+        for slot in range(current_idx, SLOTS_PER_DAY):
+            cnt = counts.get(slot, 0)
+            if cnt >= capacity:
+                continue
+            price = projected_price_for_station(cnt, station_id)
+            candidates.append((price, slot))
+        candidates.sort()
+        return sorted(slot for _, slot in candidates[:num_needed])
+
     # -----------------------------------------------------------------------
     def on_timer(self, timestamp, ctx: KeyedProcessFunction.OnTimerContext):
         idx = self.interval_state.value()
@@ -290,7 +317,30 @@ class EVFleetProcessor(KeyedProcessFunction):
                         chosen_station, idx, num_needed, station_res_counts)
                     if chosen_station else []
                 )
+            elif car_data.get('group') == 'ai':
+                # ── Q-Learning station selection (ai group) ──────────────────
+                station_prices_dict = {
+                    sid: (self.station_prices.get(sid) or STATIONS[sid]['base_price'])
+                    for sid in STATIONS
+                }
+                state          = self._q_agent.encode_state(
+                    current_soc, station_prices_dict, station_res_counts)
+                chosen_station = self._q_agent.select_action(state)
+                chosen_slots   = (
+                    self._select_cheapest_slots_at_station(
+                        chosen_station, idx, num_needed, station_res_counts)
+                    if chosen_station else []
+                )
+                # Q-update: observe next state after booking
+                next_res_counts = self._load_station_reservation_counts()
+                next_state      = self._q_agent.encode_state(
+                    current_soc, station_prices_dict, next_res_counts)
+                reward = self._q_agent.compute_reward(
+                    chosen_station, chosen_slots, station_prices_dict,
+                    current_soc, car_data)
+                self._q_agent.update(state, chosen_station, reward, next_state)
             else:
+                # ── Heuristic station selection (heuristic group) ────────────
                 chosen_station, chosen_slots = select_station_and_slots(
                     G, car_id, num_needed, idx)
 
@@ -429,13 +479,22 @@ class EVFleetProcessor(KeyedProcessFunction):
                 charge_decisions[car_id] = (False, "idle", car_data, None)
 
         # ===================================================================
-        # YIELD COMMANDS
+        # YIELD COMMANDS + track per-group metrics
         # ===================================================================
         new_station_active = {sid: 0 for sid in STATIONS}
+
+        # Per-group metrics accumulated this tick
+        group_metrics = {
+            'heuristic': {'charge_count': 0, 'emergency_count': 0,
+                          'total_cost_eur': 0.0, 'soc_sum': 0.0, 'car_count': 0},
+            'ai':        {'charge_count': 0, 'emergency_count': 0,
+                          'total_cost_eur': 0.0, 'soc_sum': 0.0, 'car_count': 0},
+        }
 
         for car_id, car_data in car_list:
             should_charge, reason_str, car_data, sid = charge_decisions[car_id]
             target_power = MAX_POWER_PER_CHARGER if should_charge else 0.0
+            car_group    = car_data.get('group', 'heuristic')
 
             self.was_charging.put(car_id, should_charge)
             if should_charge and sid:
@@ -454,6 +513,7 @@ class EVFleetProcessor(KeyedProcessFunction):
 
             command = {
                 'car_id':         car_id,
+                'group':          car_group,
                 'station_id':     sid,
                 'interval_idx':   idx,
                 'day_of_week':    day_of_week,
@@ -486,6 +546,16 @@ class EVFleetProcessor(KeyedProcessFunction):
 
             log_command(car_id, command['action'], command.get('new_soc'), idx)
             yield json.dumps(command)
+
+            # ── Per-group metrics ─────────────────────────────────────────
+            grp = group_metrics.get(car_group, group_metrics['heuristic'])
+            grp['car_count'] += 1
+            grp['soc_sum']   += car_data.get('current_soc', 0.0)
+            if should_charge and station_price:
+                grp['charge_count']   += 1
+                grp['total_cost_eur'] += station_price * 2.75 / 1000
+            if 'emergency' in reason_str.lower():
+                grp['emergency_count'] += 1
 
         # ===================================================================
         # EMIT RESERVATION STATUS
@@ -533,6 +603,23 @@ class EVFleetProcessor(KeyedProcessFunction):
             'reservation_counts':                flat_counts,
             'projected_prices':                  flat_projected,
             'timestamp':                         time.time(),
+            'group_metrics': {
+                grp: {
+                    'charge_count':   m['charge_count'],
+                    'emergency_count': m['emergency_count'],
+                    'avg_cost_eur':   round(m['total_cost_eur'] / m['charge_count'], 5)
+                                      if m['charge_count'] else 0.0,
+                    'avg_soc':        round(m['soc_sum'] / m['car_count'], 4)
+                                      if m['car_count'] else 0.0,
+                    'car_count':      m['car_count'],
+                }
+                for grp, m in group_metrics.items()
+            },
+            'q_agent_stats': {
+                'epsilon':        round(self._q_agent.epsilon, 3),
+                'steps':          self._q_agent.steps,
+                'reward_history': self._q_agent.reward_history[-50:],
+            },
         }
         yield json.dumps(reservation_status)
 
@@ -549,6 +636,7 @@ def main():
     env.add_python_file(os.path.join(project_root, "optimizers", "heuristic_scheduler.py"))
     env.add_python_file(os.path.join(project_root, "optimizers", "reservation_scheduler.py"))
     env.add_python_file(os.path.join(project_root, "optimizers", "fleet_graph.py"))
+    env.add_python_file(os.path.join(project_root, "optimizers", "ai_scheduler.py"))
     env.add_python_file(os.path.join(project_root, "config", "stations.py"))
     ev_logger_path = os.path.join(project_root, "ev_logger.py")
     if os.path.exists(ev_logger_path):
