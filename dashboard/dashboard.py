@@ -540,9 +540,18 @@ def poll_kafka():
                         st.session_state['car_stations'][car_id] = assigned_sid
                     if car_id:
                         if action == 'START_CHARGING':
-                            label = 'EMERGENCY' if 'emergency' in reason.lower() else 'CHARGING'
+                            if 'emergency' in reason.lower():
+                                label = 'EMERGENCY'
+                            elif 'arrived' in reason.lower():
+                                label = 'CHARGING'
+                            else:
+                                label = 'CHARGING'
+                        elif action == 'SET_TARGET':
+                            label = 'TRANSIT'
                         elif action == 'STOP_CHARGING':
-                            if 'full' in reason.lower():
+                            if 'transit' in reason.lower():
+                                label = 'TRANSIT'
+                            elif 'full' in reason.lower():
                                 label = 'DEFERRED_FULL'
                             elif 'price' in reason.lower():
                                 label = 'DEFERRED_PRICE'
@@ -552,12 +561,15 @@ def poll_kafka():
                             label = 'IDLE'
                         st.session_state['car_decisions'][car_id] = label
 
-                        # Store per-car reserved slots
-                        res_slots = data.get('reserved_slots', [])
-                        if res_slots:
-                            st.session_state['car_reserved_slots'][car_id] = res_slots
-                        elif car_id in st.session_state['car_reserved_slots'] and not res_slots:
-                            st.session_state['car_reserved_slots'].pop(car_id, None)
+                        # Store per-car reserved slots — only from charging commands,
+                        # not SET_TARGET (which carries no reserved_slots and would
+                        # incorrectly wipe the existing reservation).
+                        if action in ('START_CHARGING', 'STOP_CHARGING'):
+                            res_slots = data.get('reserved_slots', [])
+                            if res_slots:
+                                st.session_state['car_reserved_slots'][car_id] = res_slots
+                            elif car_id in st.session_state['car_reserved_slots']:
+                                st.session_state['car_reserved_slots'].pop(car_id, None)
 
                         _dash_log(f"CMD | {car_id} → {label} (action={action}, reason={reason})")
 
@@ -1092,24 +1104,27 @@ def _render_main_dashboard(key_sfx, group_prefix):
         _car_stations = st.session_state.get('car_stations', {})
         _all_cars = st.session_state.get('cars', {})
     
-        # Car scatter data
+        # Car scatter data — filtered to this view's group
         _cx, _cy, _csoc, _cid_list, _ccol, _ctext = [], [], [], [], [], []
         for _cid, _cd in _all_cars.items():
+            if not _cid.startswith(group_prefix):
+                continue
             _cx.append(_cd.get('x', 5.0))
             _cy.append(_cd.get('y', 5.0))
             _soc_v = _cd.get('current_soc', 0.5)
             _csoc.append(_soc_v * 100)
             _cid_list.append(_cid)
             _ccol.append(soc_color(_soc_v))
-            _ctext.append(f"{_cid} — SOC {_soc_v*100:.0f}%")
+            _transit = _cd.get('in_transit', False)
+            _ctext.append(f"{_cid} — SOC {_soc_v*100:.0f}%{' [TRANSIT]' if _transit else ''}")
     
         fig_map = go.Figure()
     
-        # Merge all travel lines into ONE trace (None separators = disconnected segments).
-        # A fixed trace count avoids Streamlit re-rendering the whole chart when charger
-        # count changes between ticks, which was causing the double-map ghost.
+        # Charging lines (plugged-in cars → station, faint cyan)
         _line_x, _line_y = [], []
         for _cid, _sid in _car_stations.items():
+            if not _cid.startswith(group_prefix):
+                continue
             _cd  = _all_cars.get(_cid, {})
             _stn = STATIONS.get(_sid, {})
             if _cd and _stn and _cd.get('plugged_in'):
@@ -1119,6 +1134,22 @@ def _render_main_dashboard(key_sfx, group_prefix):
             x=_line_x, y=_line_y,
             mode='lines',
             line=dict(color='rgba(0,229,255,0.13)', width=1),
+            hoverinfo='skip',
+            showlegend=False,
+        ))
+
+        # Transit lines (cars en-route → target station, dashed orange)
+        _tx, _ty = [], []
+        for _cid, _cd in _all_cars.items():
+            if not _cid.startswith(group_prefix):
+                continue
+            if _cd.get('in_transit') and _cd.get('target_x') is not None:
+                _tx += [_cd.get('x', 5.0), _cd['target_x'], None]
+                _ty += [_cd.get('y', 5.0), _cd['target_y'], None]
+        fig_map.add_trace(go.Scatter(
+            x=_tx, y=_ty,
+            mode='lines',
+            line=dict(color='rgba(254,211,48,0.45)', width=1, dash='dot'),
             hoverinfo='skip',
             showlegend=False,
         ))
@@ -1396,6 +1427,7 @@ def _render_main_dashboard(key_sfx, group_prefix):
         DECISION_BADGE = {
             'CHARGING':       ('&#9889; CHG',    'badge-charging'),
             'EMERGENCY':      ('&#9888; EMERGENCY', 'badge-critical'),
+            'TRANSIT':        ('&#10148; TRANSIT', 'badge-deferred-price'),
             'DEFERRED_PRICE': ('&#8987; PRICE',  'badge-deferred-price'),
             'DEFERRED_FULL':  ('&#8987; FULL',   'badge-deferred-full'),
             'IDLE':           ('&#9679; IDLE',   'badge-idle'),

@@ -1,6 +1,6 @@
 # Real-Time Cost Optimization Engine for Autonomous EV Fleets
 
-A production-grade streaming system that orchestrates a fleet of 40 autonomous electric vehicles across 3 charging stations in real time. Apache Flink processes every vehicle tick, builds a NetworkX knowledge graph, and routes each car to the station that minimises the combined **travel cost + charging cost** — not just the cheapest or nearest station.
+A production-grade streaming system that orchestrates a fleet of **80 autonomous electric vehicles** (40 heuristic + 40 AI) across 3 charging stations in real time. Apache Flink processes every vehicle tick, builds a NetworkX knowledge graph, and routes each car to the station that minimises the combined **travel cost + charging cost** — not just the cheapest or nearest station. A Q-Learning AI agent runs in parallel with the heuristic, and a three-view dashboard compares both systems live.
 
 ---
 
@@ -13,10 +13,14 @@ A production-grade streaming system that orchestrates a fleet of 40 autonomous e
   - [Configuration — `config/stations.py`](#configuration--configstationspy)
   - [Knowledge Graph — `optimizers/fleet_graph.py`](#knowledge-graph--optimizersfleet_graphpy)
   - [Reservation Scheduler — `optimizers/reservation_scheduler.py`](#reservation-scheduler--optimizersreservation_schedulerpy)
+  - [AI Scheduler — `optimizers/ai_scheduler.py`](#ai-scheduler--optimizersai_schedulerpy)
   - [Flink Orchestrator — `flink_job/process_stream.py`](#flink-orchestrator--flink_jobprocess_streampy)
   - [Car Producer — `producers/produce_car_data.py`](#car-producer--producersproduce_car_datapy)
   - [Energy Producer — `producers/produce_energy_data.py`](#energy-producer--producersproduce_energy_datapy)
   - [Dashboard — `dashboard/dashboard.py`](#dashboard--dashboarddashboardpy)
+- [Parallel Fleet Architecture](#parallel-fleet-architecture)
+- [Q-Learning Agent](#q-learning-agent)
+- [Physical Travel Simulation](#physical-travel-simulation)
 - [Cost Formula](#cost-formula)
 - [Dynamic Pricing Algorithm](#dynamic-pricing-algorithm)
 - [Routing Decision Logic](#routing-decision-logic)
@@ -52,7 +56,7 @@ A production-grade streaming system that orchestrates a fleet of 40 autonomous e
 ```
 
 **Tick rate:** 1.25 seconds = 1 simulated 15-minute slot  
-**Fleet:** 40 cars, 3 stations, 96 slots/day  
+**Fleet:** 80 cars (40 heuristic + 40 AI), 3 stations, 96 slots/day  
 **State storage:** Flink MapState (distributed, fault-tolerant)
 
 ---
@@ -98,14 +102,15 @@ docker-compose -f docker/docker-compose.yml down
 │   ├── __init__.py
 │   ├── fleet_graph.py            # NetworkX knowledge graph (no Flink imports)
 │   ├── reservation_scheduler.py  # Slot selection + replan logic
-│   └── heuristic_scheduler.py    # Fallback opportunistic charger logic
+│   ├── heuristic_scheduler.py    # Fallback opportunistic charger logic
+│   └── ai_scheduler.py           # Q-Learning agent for AI group routing
 ├── producers/
-│   ├── produce_car_data.py       # Simulates 40 EV telemetry streams
+│   ├── produce_car_data.py       # Simulates 80 EV telemetry streams (40 pairs)
 │   └── produce_energy_data.py    # Per-station dynamic pricing publisher
 ├── flink_job/
 │   └── process_stream.py         # Main Flink KeyedProcessFunction
 ├── dashboard/
-│   └── dashboard.py              # Streamlit real-time dashboard
+│   └── dashboard.py              # Streamlit real-time dashboard (3-view)
 ├── docker/
 │   ├── Dockerfile                # Custom ARM64 PyFlink image
 │   ├── docker-compose.yml        # Zookeeper + Kafka + Flink cluster
@@ -130,7 +135,9 @@ Single source of truth for all physical constants and station definitions. Every
 |---|---|---|
 | `MAX_POWER_PER_CHARGER` | `11.0 kW` | Power per charger |
 | `ENERGY_PER_SLOT` | `2.75 kWh` | Energy per 15-min slot (11 kW × 0.25 h) |
-| `MOVE_STEP` | `0.1 km` | Car movement per tick |
+| `MOVE_STEP` | `0.1 km` | Car random-walk movement per tick |
+| `TRAVEL_STEP_KM` | `0.2 km` | Directed travel speed toward a station per tick |
+| `ARRIVE_THRESHOLD_KM` | `0.3 km` | Distance at which a car is considered "at station" |
 | `CONSUMPTION_KWH_PER_KM` | `0.2 kWh/km` | EV drive consumption |
 | `ROUND_TRIP_FACTOR` | `2` | Multiply one-way distance for round trip |
 
@@ -306,30 +313,96 @@ Every tick, `slot_idx - 1` is removed from the board across all stations to prev
 
 ---
 
+### AI Scheduler — `optimizers/ai_scheduler.py`
+
+Q-Learning agent that replaces NetworkX graph routing for the `ai` group. Instantiated once per Flink job and lives in memory for the full run — no persistence across restarts (the learning curve is part of the academic comparison story).
+
+#### State Space — 13-tuple
+
+```
+(soc_band,
+ price_A_level, occ_A_level, dist_A_band, trend_A,
+ price_B_level, occ_B_level, dist_B_band, trend_B,
+ price_C_level, occ_C_level, dist_C_band, trend_C)
+```
+
+| Dimension | Values | Source |
+|---|---|---|
+| `soc_band` | 0=low(<30%), 1=mid(<50%), 2=high(≥50%) | car state |
+| `price_X_level` | 0=off-peak, 1=normal, 2=peak | live station price vs base |
+| `occ_X_level` | 0=free, 1=half-full, 2=full | reservation board counts |
+| `dist_X_band` | 0=close(<3km), 1=medium(<7km), 2=far(≥7km) | NetworkX graph edge |
+| `trend_X` | 0=falling, 1=stable, 2=rising | next-2-slot occupancy vs current |
+
+**Total states:** 3¹³ = 1,594,323 — stored as a Python dict (only visited states allocated).
+
+#### Hyperparameters
+
+| Parameter | Value | Description |
+|---|---|---|
+| `ALPHA` | 0.15 | Learning rate |
+| `GAMMA` | 0.85 | Discount factor |
+| `EPSILON_START` | 0.80 | Initial exploration probability |
+| `EPSILON_MIN` | 0.10 | Floor — never fully stop exploring |
+| `EPSILON_DECAY` | 0.997 | Multiplied after every Q-update |
+
+#### Actions
+`['station_A', 'station_B', 'station_C', None]`  
+`None` = don't book this tick (used when all stations are too expensive).
+
+#### Reward Function
+```
+reward = (2.0 − price/base_price) × num_slots   # cheaper = higher reward
+       − travel_eur × 2.0                         # penalise long trips
+       + urgency_bonus                             # +3.0 if SOC<30%, +1.0 if SOC<50%
+
+no-book penalty: −5.0 if SOC < 30%, −1.0 otherwise
+```
+
+#### Key difference vs Heuristic
+The heuristic has a **complete global view** — it evaluates all stations simultaneously and picks the mathematical minimum. The Q-agent learns through **trial and error** over many ticks. During early training (ε≈0.80), random exploration consumes cheap slots (exploration tax). As ε decays to 0.10, decisions improve but the slot pool may already be depleted — this is a known tradeoff of tabular Q-learning in finite resource environments and is visible in the Comparison tab.
+
+---
+
 ### Car Producer — `producers/produce_car_data.py`
 
-Simulates 40 autonomous EVs publishing telemetry to Kafka every 1.25 seconds.
+Simulates 80 autonomous EVs (40 identical pairs) publishing telemetry to Kafka every 1.25 seconds.
+
+#### Paired Fleet
+
+```python
+NUM_PAIRS = 40   # 40 heuristic (h_car_1…40) + 40 AI (a_car_1…40) = 80 total
+```
+
+Each pair `(h_car_i, a_car_i)` is created with **identical** starting conditions:
+- Same `start_battery` (random 10–100%)
+- Same discharge constant `k` (random 0.4–1.0)
+- Same starting `x`, `y` position
+
+This guarantees a **fair comparison** — any performance difference between groups is due purely to the routing algorithm.
 
 #### `Car` Class
 
 ```python
-Car(car_id, group_name, start_battery, priority, k)
+Car(car_id, group, start_battery, priority, k, x, y)
 ```
 
 | Attribute | Description |
 |---|---|
 | `battery_level` | Current SOC as percentage (0–100) |
 | `x`, `y` | 2D grid position in km, range 0–10 |
+| `target_x`, `target_y` | Station coordinates to travel toward (None = roam freely) |
 | `is_charging` | Controlled by Flink `START_CHARGING` commands |
-| `priority` | Integer priority (1 = highest) |
-| `k` | Discharge rate coefficient per tick (varies by car group) |
+| `priority` | Integer priority (1–5) |
+| `k` | Discharge rate coefficient per tick |
 
 **`Car.update(demand_mult)`**
-- If charging: position frozen; battery state is managed by Flink
-- If driving: battery discharged by `k × demand_mult`; position nudged ±`MOVE_STEP` on both axes and clamped to grid bounds
+- If `is_charging`: position frozen at station coordinates
+- If `target_x` set (in transit): moves `TRAVEL_STEP_KM` directly toward target each tick; snaps to station and clears target when within `ARRIVE_THRESHOLD_KM`
+- Otherwise: random walk ±`MOVE_STEP` per axis; battery discharges by `k × demand_mult`
 
 **`Car.to_dict()`**
-Serialises to Kafka payload: `id`, `current_soc`, `current_battery_kwh`, `priority`, `plugged_in`, `x`, `y`, `timestamp`.
+Serialises to Kafka payload: `id`, `group`, `current_soc`, `current_battery_kwh`, `priority`, `plugged_in`, `x`, `y`, `in_transit`, `target_x`, `target_y`, `timestamp`.
 
 #### `demand_multiplier(interval_idx, day_of_week) -> float`
 Simulates real-world EV charging demand patterns:
@@ -444,6 +517,67 @@ Polls all 3 Kafka topics with 100 ms timeout (3000 ms on first connect). Process
 
 ---
 
+## Parallel Fleet Architecture
+
+The system runs two groups of 40 cars simultaneously in the **same Flink job**, competing for the same physical chargers.
+
+| Group | Car IDs | Routing | Phase 1 Decision |
+|---|---|---|---|
+| Heuristic | `h_car_1` … `h_car_40` | NetworkX graph | `select_station_and_slots()` — global minimum of travel + charging cost |
+| AI | `a_car_1` … `a_car_40` | Q-Learning agent | `QLearningAgent.select_action()` — learned policy from Q-table |
+
+Both groups share the same reservation board, the same physical chargers, and the same dynamic prices. Phase 2 execution (charger allocation, capacity enforcement) is identical for both groups.
+
+**Per-group metrics** are emitted every tick in `RESERVATION_STATUS.group_metrics`:
+- `charge_count`, `emergency_count`, `avg_cost_eur`, `avg_soc`, `car_count`
+
+**Dashboard Comparison tab** displays these metrics side by side with a bar chart.
+
+---
+
+## Q-Learning Agent
+
+See [`optimizers/ai_scheduler.py`](#ai-scheduler--optimizersai_schedulerpy) for full detail.
+
+#### Why the heuristic can still win
+
+During early training, the Q-agent's ε=0.80 means 80% of decisions are random. Random choices consume cheap/off-peak slots that the heuristic would have used. By the time ε decays and the agent has learned, the best slots are already taken — the agent is forced into leftovers. This **exploration tax** is a fundamental tradeoff of tabular Q-learning in finite-resource environments and is clearly visible in the Comparison tab over time.
+
+#### What the Q-agent can do that the heuristic cannot
+
+- Encodes **distance** (via NetworkX edge data) into its state — learns "station B cheap AND close → prefer it"
+- Encodes **price trend** — rising occupancy in next 2 slots means "book now before it peaks"
+- Accumulates experience across all 40 AI cars (shared Q-table instance within the Flink job)
+
+---
+
+## Physical Travel Simulation
+
+Cars physically travel to their assigned station before they can charge.
+
+#### Flow
+1. **Phase 1 (reservation):** Flink picks a station → emits `SET_TARGET` command with station `x`, `y`
+2. **Producer:** Car moves `TRAVEL_STEP_KM = 0.2 km/tick` directly toward target instead of random walking; battery still drains during travel
+3. **Arrival:** When within `ARRIVE_THRESHOLD_KM = 0.3 km`, car snaps to station coordinates and clears target
+4. **Phase 2 (execution):** Flink checks `distance(car, station) ≤ ARRIVE_THRESHOLD_KM` before allowing charging — cars still in transit receive `STOP_CHARGING` with `reason=in_transit`
+5. **Charging start:** `START_CHARGING` command snaps car to exact station coordinates; car freezes there until charging stops
+
+#### Travel time examples
+
+| Distance | Ticks to arrive | Real time |
+|---|---|---|
+| 2 km | 10 ticks | ~12.5 s |
+| 5 km | 25 ticks | ~31 s |
+| 10 km | 50 ticks | ~62 s |
+
+#### Dashboard visibility
+- **Dashed yellow lines** on Fleet Grid Map: car → target station (in transit)
+- **Solid cyan lines**: car → station (plugged in / charging)
+- `TRANSIT` badge in Fleet Status cards
+- Car hover tooltip shows `[TRANSIT]`
+
+---
+
 ## Cost Formula
 
 The fundamental optimisation every non-emergency car solves each replan:
@@ -519,9 +653,9 @@ for each car sorted by SOC ascending (most critical first):
 
 | Topic | Producer | Consumers | Message Types |
 |---|---|---|---|
-| `cars_real` | Car Producer | Flink | Car telemetry: `id`, `current_soc`, `x`, `y`, `plugged_in`, `priority`, `timestamp` |
+| `cars_real` | Car Producer | Flink | Car telemetry: `id`, `group`, `current_soc`, `x`, `y`, `in_transit`, `target_x`, `target_y`, `plugged_in`, `priority`, `timestamp` |
 | `energy_data` | Energy Producer | Flink, Dashboard | `DYNAMIC_PRICE` with per-station pricing breakdown and learned hourly profiles |
-| `charging_commands` | Flink | Car Producer, Energy Producer, Dashboard | `START_CHARGING`, `STOP_CHARGING`, `RESERVATION_STATUS` |
+| `charging_commands` | Flink | Car Producer, Energy Producer, Dashboard | `START_CHARGING`, `STOP_CHARGING`, `SET_TARGET`, `RESERVATION_STATUS` (with `group_metrics`, `q_agent_stats`) |
 
 ---
 
@@ -545,19 +679,31 @@ EVFleetProcessor  (KeyedProcessFunction, key = "fleet")
 
 ## Dashboard Panels
 
+The dashboard uses `st.radio(horizontal=True)` navigation (not `st.tabs`) so only the selected view's Python code executes — preventing ghost content bleed between views.
+
+#### Navigation Views
+
+| View | Contents |
+|---|---|
+| **Heuristic** | Full dashboard filtered to `h_car_*` group only |
+| **AI Agent** | Full dashboard filtered to `a_car_*` group + Q-agent epsilon/reward sparkline |
+| **Comparison** | Metrics table + bar chart comparing both groups — no charts, no panels |
+
+#### Panels (Heuristic and AI Agent views)
+
 | Panel | Column | Description |
 |---|---|---|
 | Diagnostics bar | Full width | Kafka status, message counts per topic, host |
-| Station cards (×3) | Full width | Live price, charger occupancy bar, price state for each station |
+| Station cards (×3) | Full width | Live price, charger occupancy bar, price state per station |
 | Real-Time Price Feed | Left | 3 coloured lines — rolling price history per station |
 | Active Chargers | Left | 3 lines — busy charger count per station vs. capacity cap |
 | Peak Frequency by Hour | Left | 3 tabs — per-station learned peak-hour histogram |
 | Willingness-to-Pay | Left | SOC band → max price a car in that band will accept |
-| Reservation Board | Left | Per-station slot grid with correct charger capacity (5 / 3 / 4) |
-| Fleet Grid Map | Left | 2D scatter: car dots coloured by SOC, station squares by occupancy, travel lines to charging stations |
-| Routing Decision Matrix | Right | Per-car: Travel€ + Charge€ = Total€ for all 3 stations, chosen station highlighted ✓ |
+| Reservation Board | Left | Per-station slot grid with charger capacity (5 / 3 / 4) |
+| Fleet Grid Map | Left | 2D scatter: car dots coloured by SOC, station squares by occupancy; **dashed yellow lines** = cars in transit; solid cyan lines = cars charging |
+| Routing Decision Matrix | Right | Per-car: Travel€ + Charge€ = Total€ for all 3 stations; ✓ marks the current cheapest option using occupancy-projected prices (matches Flink logic) |
 | Charging Stations | Right | Live charger slots per station — which car is currently plugged in |
-| Fleet Status | Right | Compact car cards: SOC bar, kWh, priority, station badge, decision badge |
+| Fleet Status | Right | Compact car cards: SOC bar, kWh, priority, station badge; badges include `CHARGING`, `TRANSIT`, `EMERGENCY`, `DEFERRED_PRICE`, `DEFERRED_FULL`, `IDLE` |
 
 ---
 

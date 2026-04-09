@@ -12,7 +12,9 @@ import math
 # ---------------------------------------------------------------------------
 MAX_POWER_PER_CHARGER       = 11.0          # kW per charger
 ENERGY_PER_SLOT             = 11.0 * 0.25  # 2.75 kWh per simulated 15-min slot
-MOVE_STEP                   = 0.1           # km per tick — car moves ±MOVE_STEP per axis
+MOVE_STEP                   = 0.1           # km per tick — car moves ±MOVE_STEP per axis (random walk)
+TRAVEL_STEP_KM              = 0.2           # km per tick — directed travel toward a station (2× random)
+ARRIVE_THRESHOLD_KM         = 0.3           # km — car is considered "at station" within this distance
 CONSUMPTION_KWH_PER_KM      = 0.2           # EV energy consumption while driving
 ROUND_TRIP_FACTOR           = 2             # multiply one-way distance for round trip
 

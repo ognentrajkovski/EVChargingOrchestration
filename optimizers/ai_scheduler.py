@@ -4,14 +4,22 @@ Q-Learning Agent for EV Charging Station Selection
 Replaces the NetworkX graph-based station selection (fleet_graph.select_station_and_slots)
 with a Q-learning policy that learns which station to pick based on observed state.
 
-State space (7-tuple):
-  (soc_band, price_A_level, occ_A_level, price_B_level, occ_B_level, price_C_level, occ_C_level)
+State space (13-tuple):
+  (soc_band,
+   price_A_level, occ_A_level, dist_A_band, trend_A,
+   price_B_level, occ_B_level, dist_B_band, trend_B,
+   price_C_level, occ_C_level, dist_C_band, trend_C)
 
   soc_band          : 0=low(<30%), 1=mid(<50%), 2=high(>=50%)
   price_X_level     : 0=off-peak, 1=normal, 2=peak  (relative to station base_price)
   occ_X_level       : 0=free, 1=half-full, 2=full
+  dist_X_band       : 0=close(<3 km), 1=medium(<7 km), 2=far(>=7 km)
+                      — extracted from the NetworkX graph travel distances
+  trend_X           : 0=falling, 1=stable, 2=rising
+                      — compares reservation count at current slot vs next 2 slots;
+                        rising occupancy = rising price = book now before it gets worse
 
-Total states: 3 × (3×3)^3 = 2187 — stored as a Python dict, ~17 KB.
+Total states: 3^13 = 1 594 323 — stored as a Python dict (only visited states allocated).
 
 Actions: ['station_A', 'station_B', 'station_C', None]
   None means "don't book this tick" (used when all stations are too expensive).
@@ -80,6 +88,8 @@ class QLearningAgent:
         soc: float,
         station_prices: dict,
         station_res_counts: dict,
+        station_distances: dict = None,
+        current_idx: int = 0,
     ) -> tuple:
         """
         Encode the observable environment into a discrete state tuple.
@@ -89,6 +99,10 @@ class QLearningAgent:
         soc                : car's state of charge (0.0 – 1.0)
         station_prices     : {station_id: current_price_eur_mwh}
         station_res_counts : {station_id: {slot_idx: reservation_count}}
+        station_distances  : {station_id: distance_km}  — from NetworkX graph edges.
+                             If None, all stations are treated as medium distance.
+        current_idx        : current simulation slot index (0-95) — used to read
+                             next 2 slots' reservation counts for the price trend.
         """
         STATIONS = _get_stations()
         soc_band = 0 if soc < 0.30 else (1 if soc < 0.50 else 2)
@@ -100,11 +114,27 @@ class QLearningAgent:
                            else 1 if price < base * 1.30
                            else 2)
             cap    = STATIONS[sid]['capacity']
-            active = sum(station_res_counts.get(sid, {}).values())
+            counts = station_res_counts.get(sid, {})
+            active = sum(counts.values())
             occ_level = (0 if active == 0
                          else 1 if active < cap * 0.6
                          else 2)
-            parts.extend([price_level, occ_level])
+            # Distance band from NetworkX graph (0=close, 1=medium, 2=far)
+            dist_km   = (station_distances or {}).get(sid, 5.0)
+            dist_band = (0 if dist_km < 3.0 else 1 if dist_km < 7.0 else 2)
+            # Price trend: compare current slot occupancy vs avg of next 2 slots
+            # Rising occupancy → rising price → book now (trend=2)
+            # Falling occupancy → falling price → can wait (trend=0)
+            cur_cnt  = counts.get(current_idx, 0)
+            next_avg = (counts.get(current_idx + 1, 0)
+                        + counts.get(current_idx + 2, 0)) / 2.0
+            if next_avg > cur_cnt * 1.20:
+                trend = 2   # occupancy rising  → prices going up
+            elif next_avg < cur_cnt * 0.80:
+                trend = 0   # occupancy falling → prices going down
+            else:
+                trend = 1   # stable
+            parts.extend([price_level, occ_level, dist_band, trend])
         return tuple(parts)
 
     def select_action(self, state: tuple):

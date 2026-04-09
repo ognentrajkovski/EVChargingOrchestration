@@ -24,6 +24,7 @@ Reservation board key format: "{station_id}:{slot_idx}"  (e.g. "station_A:47")
 
 import json
 import logging
+import math
 import sys
 import os
 import time
@@ -50,7 +51,7 @@ from fleet_graph import (
     get_cars_reserved_at_slot,
     get_reservation_summary,
 )
-from stations import STATIONS, projected_price_for_station
+from stations import STATIONS, projected_price_for_station, ARRIVE_THRESHOLD_KM
 from ai_scheduler import QLearningAgent
 
 import sys, os
@@ -323,8 +324,15 @@ class EVFleetProcessor(KeyedProcessFunction):
                     sid: (self.station_prices.get(sid) or STATIONS[sid]['base_price'])
                     for sid in STATIONS
                 }
+                # Extract per-station distances from the NetworkX graph
+                station_distances = {}
+                for sid in STATIONS:
+                    edge = G.get_edge_data(car_id, sid)
+                    station_distances[sid] = edge['distance_km'] if edge else 5.0
+
                 state          = self._q_agent.encode_state(
-                    current_soc, station_prices_dict, station_res_counts)
+                    current_soc, station_prices_dict, station_res_counts,
+                    station_distances, current_idx=idx)
                 chosen_station = self._q_agent.select_action(state)
                 chosen_slots   = (
                     self._select_cheapest_slots_at_station(
@@ -334,7 +342,8 @@ class EVFleetProcessor(KeyedProcessFunction):
                 # Q-update: observe next state after booking
                 next_res_counts = self._load_station_reservation_counts()
                 next_state      = self._q_agent.encode_state(
-                    current_soc, station_prices_dict, next_res_counts)
+                    current_soc, station_prices_dict, next_res_counts,
+                    station_distances, current_idx=idx)
                 reward = self._q_agent.compute_reward(
                     chosen_station, chosen_slots, station_prices_dict,
                     current_soc, car_data)
@@ -359,6 +368,18 @@ class EVFleetProcessor(KeyedProcessFunction):
             log('RESERVATION',
                 f'{car_id} | soc={current_soc*100:.1f}% | '
                 f'station={chosen_station} | slots={chosen_slots}')
+
+            # Tell the car producer to start moving toward the assigned station
+            stn = STATIONS[chosen_station]
+            yield json.dumps({
+                'car_id':      car_id,
+                'group':       car_data.get('group', 'heuristic'),
+                'action':      'SET_TARGET',
+                'station_id':  chosen_station,
+                'station_x':   stn['x'],
+                'station_y':   stn['y'],
+                'timestamp':   time.time(),
+            })
 
         # ===================================================================
         # PHASE 2 — EXECUTION
@@ -422,6 +443,17 @@ class EVFleetProcessor(KeyedProcessFunction):
                 charge_decisions[car_id] = (False, "full", car_data, None)
                 continue
             sid = reserved_this_slot.get(car_id)
+            if sid:
+                # Check car has physically arrived at the station
+                stn   = STATIONS[sid]
+                car_x = car_data.get('x', 5.0)
+                car_y = car_data.get('y', 5.0)
+                dist  = math.sqrt((car_x - stn['x'])**2 + (car_y - stn['y'])**2)
+                if dist > ARRIVE_THRESHOLD_KM:
+                    car_data['emergency_charging'] = False
+                    charge_decisions[car_id] = (False, "in_transit", car_data, sid)
+                    log('FLINK', f'{car_id} | IN_TRANSIT → {sid} | dist={dist:.2f}km')
+                    continue
             if sid and station_busy[sid] < STATIONS[sid]['capacity']:
                 station_busy[sid] += 1
                 car_data['emergency_charging'] = False
@@ -443,11 +475,29 @@ class EVFleetProcessor(KeyedProcessFunction):
             planned_sid = car_res.get('station_id') if car_res else 'station_A'
             proxy_price = (self.station_prices.get(planned_sid)
                            or STATIONS.get(planned_sid, {}).get('base_price', BASE_PRICE))
-            car_wants_to_charge = decide_charge(car_data, proxy_price, prev_charging)
 
             if current_soc >= 0.99:
                 charge_decisions[car_id] = (False, "full", car_data, None)
                 continue
+
+            # If the car has already arrived at its planned station, charge
+            # immediately — don't wait for the reserved slot tick or run a
+            # price check. The car travelled here; use the charger.
+            car_x = car_data.get('x', 5.0)
+            car_y = car_data.get('y', 5.0)
+            if planned_sid and current_soc < 0.99:
+                stn_p = STATIONS.get(planned_sid, {})
+                dist_to_planned = math.sqrt(
+                    (car_x - stn_p.get('x', 0))**2 + (car_y - stn_p.get('y', 0))**2)
+                if (dist_to_planned <= ARRIVE_THRESHOLD_KM
+                        and station_busy.get(planned_sid, 0) < stn_p.get('capacity', 0)):
+                    station_busy[planned_sid] += 1
+                    car_data['emergency_charging'] = False
+                    charge_decisions[car_id] = (True, "arrived", car_data, planned_sid)
+                    log('FLINK', f'{car_id} | ARRIVED → {planned_sid} | soc={current_soc*100:.1f}%')
+                    continue
+
+            car_wants_to_charge = decide_charge(car_data, proxy_price, prev_charging)
 
             if car_wants_to_charge:
                 # Pick nearest station with free capacity
@@ -458,7 +508,6 @@ class EVFleetProcessor(KeyedProcessFunction):
                 for sid, stn in STATIONS.items():
                     if station_busy[sid] >= stn['capacity']:
                         continue
-                    import math
                     dist = math.sqrt((car_x - stn['x'])**2 + (car_y - stn['y'])**2)
                     if dist < best_dist:
                         best_dist = dist
@@ -511,10 +560,13 @@ class EVFleetProcessor(KeyedProcessFunction):
                 if sid else BASE_PRICE
             )
 
+            stn_coords = STATIONS.get(sid, {}) if sid else {}
             command = {
                 'car_id':         car_id,
                 'group':          car_group,
                 'station_id':     sid,
+                'station_x':      stn_coords.get('x'),
+                'station_y':      stn_coords.get('y'),
                 'interval_idx':   idx,
                 'day_of_week':    day_of_week,
                 'action':         'START_CHARGING' if should_charge else 'STOP_CHARGING',

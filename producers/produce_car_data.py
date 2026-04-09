@@ -1,13 +1,14 @@
 import json
 import time
 import random
+import math
 import threading
 from kafka import KafkaProducer, KafkaConsumer
 import sys, os
 # producers/ -> go up one level to project root
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ev_logger import log, log_error
-from config.stations import MOVE_STEP
+from config.stations import MOVE_STEP, TRAVEL_STEP_KM, ARRIVE_THRESHOLD_KM
 
 # Configuration
 NUM_PAIRS        = 40          # 40 heuristic + 40 AI = 80 cars total
@@ -30,10 +31,31 @@ class Car:
         self.is_parked   = False
         self.x = x
         self.y = y
+        self.target_x = None          # station x to travel toward (None = roam freely)
+        self.target_y = None
 
     def update(self, demand_mult: float = 1.0):
         if self.is_charging:
             log('CAR_UPDATE', f"{self.id} | CHARGING | batt={self.battery_level:.1f}%")
+        elif self.target_x is not None:
+            # Directed travel toward assigned station
+            dx   = self.target_x - self.x
+            dy   = self.target_y - self.y
+            dist = math.sqrt(dx * dx + dy * dy)
+            if dist <= ARRIVE_THRESHOLD_KM:
+                # Snap to station and clear target
+                self.x       = self.target_x
+                self.y       = self.target_y
+                self.target_x = None
+                self.target_y = None
+                log('CAR_UPDATE', f"{self.id} | ARRIVED | pos=({self.x:.1f},{self.y:.1f})")
+            else:
+                self.x = max(0.0, min(GRID_SIZE, self.x + (dx / dist) * TRAVEL_STEP_KM))
+                self.y = max(0.0, min(GRID_SIZE, self.y + (dy / dist) * TRAVEL_STEP_KM))
+                log('CAR_UPDATE',
+                    f"{self.id} | TRANSIT | batt={self.battery_level:.1f}% | "
+                    f"dist={dist:.2f}km | pos=({self.x:.1f},{self.y:.1f})")
+            self.battery_level = max(0.0, self.battery_level - self.k * demand_mult)
         elif not self.is_parked:
             self.battery_level = max(0.0, self.battery_level - self.k * demand_mult)
             self.x = max(0.0, min(GRID_SIZE, self.x + random.uniform(-MOVE_STEP, MOVE_STEP)))
@@ -52,6 +74,9 @@ class Car:
             "plugged_in":          self.is_parked,
             "x":                   round(self.x, 4),
             "y":                   round(self.y, 4),
+            "in_transit":          self.target_x is not None,
+            "target_x":            round(self.target_x, 4) if self.target_x is not None else None,
+            "target_y":            round(self.target_y, 4) if self.target_y is not None else None,
             "timestamp":           time.time(),
         }
 
@@ -110,11 +135,26 @@ def consume_commands():
         with cars_lock:
             if car_id in cars_map:
                 car = cars_map[car_id]
-                if action == 'START_CHARGING':
+                if action == 'SET_TARGET':
+                    tx = cmd.get('station_x')
+                    ty = cmd.get('station_y')
+                    if tx is not None and ty is not None:
+                        car.target_x = float(tx)
+                        car.target_y = float(ty)
+                        log('CAR_PROD', f"{car_id} | SET_TARGET | ({tx:.1f},{ty:.1f})")
+                elif action == 'START_CHARGING':
                     log('CAR_PROD',
                         f"{car_id} | START_CHARGING | new_soc={new_soc} | batt_before={car.battery_level:.1f}%")
                     if new_soc is not None:
                         car.battery_level = new_soc * 100.0
+                    # Snap to station position
+                    sx = cmd.get('station_x')
+                    sy = cmd.get('station_y')
+                    if sx is not None and sy is not None:
+                        car.x = float(sx)
+                        car.y = float(sy)
+                    car.target_x    = None
+                    car.target_y    = None
                     car.is_charging = True
                     car.is_parked   = True
                 elif action == 'STOP_CHARGING':
