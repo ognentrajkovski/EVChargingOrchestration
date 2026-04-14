@@ -714,7 +714,7 @@ The dashboard uses `st.radio(horizontal=True)` navigation (not `st.tabs`) so onl
 
 ### Methodology
 
-A capacity overload stress test was conducted across a simulated **20×20 km city grid** with **20 charging stations** (122 total charger slots). Six load scenarios were tested, each running for approximately 20 minutes of real time. Both the heuristic and Q-learning AI agent operated simultaneously under identical conditions — same cars, same starting SOC, same prices — only the routing algorithm differed.
+A capacity overload stress test was conducted across a simulated **20×20 km city grid** with **20 charging stations** (122 total charger slots). Six load scenarios were tested, each running for approximately 25-30 minutes of real time. Both the heuristic and Q-learning AI agent operated simultaneously under identical conditions — same cars, same starting SOC, same prices — only the routing algorithm differed.
 
 ---
 
