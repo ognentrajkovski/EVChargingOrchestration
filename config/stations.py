@@ -20,32 +20,31 @@ ROUND_TRIP_FACTOR           = 2             # multiply one-way distance for roun
 
 # ---------------------------------------------------------------------------
 # Station definitions
-# Coordinates are in km on a 10 × 10 grid.
+# Coordinates are in km on a 20 × 20 grid.
 # base_price: EUR/MWh — used for both dynamic pricing and travel-cost calculation.
 # capacity  : number of physical chargers at that station.
 # ---------------------------------------------------------------------------
 STATIONS = {
-    "station_A": {
-        "name":       "Alpha",
-        "x":          2.0,
-        "y":          2.0,
-        "base_price": 50.0,
-        "capacity":   5,
-    },
-    "station_B": {
-        "name":       "Beta",
-        "x":          8.0,
-        "y":          8.0,
-        "base_price": 40.0,   # cheapest per kWh, but far from some cars
-        "capacity":   3,
-    },
-    "station_C": {
-        "name":       "Gamma",
-        "x":          5.0,
-        "y":          2.0,
-        "base_price": 70.0,   # premium / central location
-        "capacity":   4,
-    },
+    "station_A": {"name": "Alpha",    "x":  2.0, "y":  2.0, "base_price": 48.0, "capacity": 6},
+    "station_B": {"name": "Beta",     "x":  2.0, "y": 10.0, "base_price": 45.0, "capacity": 5},
+    "station_C": {"name": "Gamma",    "x":  2.0, "y": 18.0, "base_price": 48.0, "capacity": 6},
+    "station_D": {"name": "Delta",    "x": 10.0, "y":  2.0, "base_price": 55.0, "capacity": 7},
+    "station_E": {"name": "Epsilon",  "x": 10.0, "y":  6.0, "base_price": 62.0, "capacity": 7},
+    "station_F": {"name": "Zeta",     "x": 10.0, "y": 10.0, "base_price": 72.0, "capacity": 8},
+    "station_G": {"name": "Eta",      "x": 10.0, "y": 14.0, "base_price": 62.0, "capacity": 7},
+    "station_H": {"name": "Theta",    "x": 10.0, "y": 18.0, "base_price": 55.0, "capacity": 6},
+    "station_I": {"name": "Iota",     "x": 18.0, "y":  2.0, "base_price": 45.0, "capacity": 5},
+    "station_J": {"name": "Kappa",    "x": 18.0, "y": 10.0, "base_price": 48.0, "capacity": 6},
+    "station_K": {"name": "Lambda",   "x": 18.0, "y": 18.0, "base_price": 45.0, "capacity": 5},
+    "station_L": {"name": "Mu",       "x":  5.0, "y":  5.0, "base_price": 52.0, "capacity": 6},
+    "station_M": {"name": "Nu",       "x":  5.0, "y": 15.0, "base_price": 50.0, "capacity": 5},
+    "station_N": {"name": "Xi",       "x": 15.0, "y":  5.0, "base_price": 52.0, "capacity": 6},
+    "station_O": {"name": "Omicron",  "x": 15.0, "y": 15.0, "base_price": 50.0, "capacity": 6},
+    "station_P": {"name": "Pi",       "x":  7.0, "y": 10.0, "base_price": 58.0, "capacity": 7},
+    "station_Q": {"name": "Rho",      "x": 13.0, "y": 10.0, "base_price": 58.0, "capacity": 7},
+    "station_R": {"name": "Sigma",    "x": 10.0, "y":  4.0, "base_price": 56.0, "capacity": 6},
+    "station_S": {"name": "Tau",      "x": 10.0, "y": 16.0, "base_price": 56.0, "capacity": 6},
+    "station_T": {"name": "Upsilon",  "x":  6.0, "y": 18.0, "base_price": 47.0, "capacity": 5},
 }
 
 # ---------------------------------------------------------------------------
@@ -56,6 +55,8 @@ PRICE_LEVELS = [
     (0.60, 1.0),   # normal    : ≤ 60 % occupied → 1.0 × base_price
     (1.01, 1.8),   # peak      : > 60 % occupied → 1.8 × base_price
 ]
+
+DECISION_MODE = 'heuristic'
 
 
 # ---------------------------------------------------------------------------

@@ -664,38 +664,42 @@ def _group_active_per_station(group_prefix):
     return counts
 
 def _render_station_row(active_per_station):
-    """Render station cards showing per-group active charger counts."""
-    _cols = st.columns(len(STATIONS))
-    for _col, (sid, stn_cfg) in zip(_cols, STATIONS.items()):
-        with _col:
-            _sd        = station_data.get(sid, {})
-            _sp        = _sd.get('current_price', stn_cfg['base_price'])
-            _sa        = active_per_station.get(sid, 0)
-            _cap       = stn_cfg['capacity']
-            _occ_col   = occupancy_color(_sa, _cap)
-            _price_col = ('#ff4b4b' if _sp > stn_cfg['base_price'] * 1.4
-                          else '#26de81' if _sp <= stn_cfg['base_price'] * 1.05
-                          else '#fed330')
-            st.markdown(f"""
-            <div style="background:#080f1a;border:1px solid #0f1f30;border-radius:10px;
-                        padding:0.6rem 0.8rem;margin-bottom:0.5rem;border-left:3px solid {_occ_col}">
-              <div style="font-family:JetBrains Mono,monospace;font-size:0.52rem;color:#4a6070;
-                          letter-spacing:0.12em;text-transform:uppercase">{stn_cfg['name']}</div>
-              <div style="display:flex;align-items:baseline;gap:6px;margin-top:2px">
-                <span style="font-family:JetBrains Mono,monospace;font-size:1.05rem;
-                             font-weight:700;color:{_price_col}">{_sp:.1f}</span>
-                <span style="font-size:0.58rem;color:#4a6070">€/MWh</span>
-              </div>
-              <div style="display:flex;align-items:center;gap:6px;margin-top:4px">
-                <div style="flex:1;height:5px;background:#0a1525;border-radius:2px;overflow:hidden">
-                  <div style="height:100%;width:{int(_sa/_cap*100) if _cap else 0}%;
-                              background:{_occ_col};border-radius:2px;transition:width 0.5s"></div>
+    """Render station cards showing per-group active charger counts (5 per row)."""
+    _stn_items = list(STATIONS.items())
+    _chunk_size = 5
+    for _chunk_start in range(0, len(_stn_items), _chunk_size):
+        _chunk = _stn_items[_chunk_start:_chunk_start + _chunk_size]
+        _cols = st.columns(len(_chunk))
+        for _col, (sid, stn_cfg) in zip(_cols, _chunk):
+            with _col:
+                _sd        = station_data.get(sid, {})
+                _sp        = _sd.get('current_price', stn_cfg['base_price'])
+                _sa        = active_per_station.get(sid, 0)
+                _cap       = stn_cfg['capacity']
+                _occ_col   = occupancy_color(_sa, _cap)
+                _price_col = ('#ff4b4b' if _sp > stn_cfg['base_price'] * 1.4
+                              else '#26de81' if _sp <= stn_cfg['base_price'] * 1.05
+                              else '#fed330')
+                st.markdown(f"""
+                <div style="background:#080f1a;border:1px solid #0f1f30;border-radius:10px;
+                            padding:0.6rem 0.8rem;margin-bottom:0.5rem;border-left:3px solid {_occ_col}">
+                  <div style="font-family:JetBrains Mono,monospace;font-size:0.52rem;color:#4a6070;
+                              letter-spacing:0.12em;text-transform:uppercase">{stn_cfg['name']}</div>
+                  <div style="display:flex;align-items:baseline;gap:6px;margin-top:2px">
+                    <span style="font-family:JetBrains Mono,monospace;font-size:1.05rem;
+                                 font-weight:700;color:{_price_col}">{_sp:.1f}</span>
+                    <span style="font-size:0.58rem;color:#4a6070">€/MWh</span>
+                  </div>
+                  <div style="display:flex;align-items:center;gap:6px;margin-top:4px">
+                    <div style="flex:1;height:5px;background:#0a1525;border-radius:2px;overflow:hidden">
+                      <div style="height:100%;width:{int(_sa/_cap*100) if _cap else 0}%;
+                                  background:{_occ_col};border-radius:2px;transition:width 0.5s"></div>
+                    </div>
+                    <span style="font-family:JetBrains Mono,monospace;font-size:0.65rem;
+                                 font-weight:600;color:{_occ_col}">{_sa}/{_cap} charging</span>
+                  </div>
                 </div>
-                <span style="font-family:JetBrains Mono,monospace;font-size:0.65rem;
-                             font-weight:600;color:{_occ_col}">{_sa}/{_cap} charging</span>
-              </div>
-            </div>
-            """, unsafe_allow_html=True)
+                """, unsafe_allow_html=True)
 
 def _render_group_metrics(gm, sc):
     avg_cost = _gm_avg_cost(gm)
@@ -1199,9 +1203,9 @@ def _render_main_dashboard(key_sfx, group_prefix):
             height=280,
             paper_bgcolor='#0d1520', plot_bgcolor='#0d1520',
             margin=dict(l=20, r=20, t=10, b=20),
-            xaxis=dict(range=[-0.5, 10.5], gridcolor='#1e2d3d', zeroline=False,
+            xaxis=dict(range=[-0.5, 20.5], gridcolor='#1e2d3d', zeroline=False,
                        tickfont=dict(color='#4a6070', size=8), title='km'),
-            yaxis=dict(range=[-0.5, 10.5], gridcolor='#1e2d3d', zeroline=False,
+            yaxis=dict(range=[-0.5, 20.5], gridcolor='#1e2d3d', zeroline=False,
                        tickfont=dict(color='#4a6070', size=8), title='km',
                        scaleanchor='x', scaleratio=1),
         )
@@ -1339,8 +1343,7 @@ def _render_main_dashboard(key_sfx, group_prefix):
     
         if _rdm_active:
             _stn_ids   = list(STATIONS.keys())
-            _stn_short = {'station_A': 'Alpha', 'station_B': 'Beta', 'station_C': 'Gamma'}
-    
+
             rdm_html = '<div style="overflow-x:auto">'
             # Table header
             rdm_html += ('<table style="border-collapse:collapse;width:100%;font-family:JetBrains Mono,'
@@ -1364,7 +1367,8 @@ def _render_main_dashboard(key_sfx, group_prefix):
                              '<td style="padding:2px 5px;text-align:right;font-weight:600">Total€</td>')
             rdm_html += '</tr>'
     
-            for _cid, _chosen_sid in _rdm_active[:20]:   # cap at 20 rows
+            _rdm_active = _rdm_active[:25]   # top 25 most urgent (lowest SOC)
+            for _cid, _chosen_sid in _rdm_active:
                 _car   = cars.get(_cid, {})
                 _soc   = float(_car.get('current_soc', 0.5))
                 _cx    = float(_car.get('x', 5.0))
@@ -1413,6 +1417,7 @@ def _render_main_dashboard(key_sfx, group_prefix):
     
             rdm_html += '</table></div>'
             st.markdown(rdm_html, unsafe_allow_html=True)
+            st.caption("Showing top 25 most urgent cars (lowest SOC) — 500 cars total")
             st.markdown(
                 '<div style="font-family:JetBrains Mono,monospace;font-size:0.52rem;color:#1a3048;'
                 'margin-top:0.3rem">Travel€ = 2 × distance × 0.2kWh/km × base_price · '

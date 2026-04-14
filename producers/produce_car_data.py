@@ -11,13 +11,13 @@ from ev_logger import log, log_error
 from config.stations import MOVE_STEP, TRAVEL_STEP_KM, ARRIVE_THRESHOLD_KM
 
 # Configuration
-NUM_PAIRS        = 40          # 40 heuristic + 40 AI = 80 cars total
+NUM_PAIRS        = 250         # 250 heuristic + 250 AI = 500 cars total
 UPDATE_INTERVAL  = 1.25
 TOPIC_REAL       = "cars_real"
 TOPIC_COMMANDS   = "charging_commands"
 BOOTSTRAP_SERVERS = os.environ.get('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092')
 BATTERY_CAPACITY_KWH = 60.0
-GRID_SIZE        = 10.0        # km — grid spans 0..10 in both axes
+GRID_SIZE        = 20.0        # km — grid spans 0..20 in both axes
 
 
 class Car:
@@ -167,7 +167,7 @@ def consume_commands():
 
 
 def main():
-    print("Starting Car Producer — 40 heuristic + 40 AI pairs (identical starting conditions)…")
+    print("Starting Car Producer — 250 heuristic + 250 AI pairs (500 cars, 20×20 km city grid)…")
 
     producer = KafkaProducer(
         bootstrap_servers=BOOTSTRAP_SERVERS,

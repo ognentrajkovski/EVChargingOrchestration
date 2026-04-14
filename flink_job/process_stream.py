@@ -335,10 +335,15 @@ class EVFleetProcessor(KeyedProcessFunction):
                     edge = G.get_edge_data(car_id, sid)
                     station_distances[sid] = edge['distance_km'] if edge else 5.0
 
+                top3_stations  = q_agent.get_top3_stations(station_distances)
                 state          = q_agent.encode_state(
                     current_soc, station_prices_dict, station_res_counts,
-                    station_distances, current_idx=idx)
-                chosen_station = q_agent.select_action(state)
+                    top3_stations, station_distances, current_idx=idx)
+                action         = q_agent.select_action(state)
+                # Resolve positional index to an actual station ID
+                chosen_station = (top3_stations[action]
+                                  if action is not None and action < len(top3_stations)
+                                  else None)
                 chosen_slots   = (
                     self._select_cheapest_slots_at_station(
                         chosen_station, idx, num_needed, station_res_counts)
@@ -348,11 +353,11 @@ class EVFleetProcessor(KeyedProcessFunction):
                 next_res_counts = self._load_station_reservation_counts()
                 next_state      = q_agent.encode_state(
                     current_soc, station_prices_dict, next_res_counts,
-                    station_distances, current_idx=idx)
+                    top3_stations, station_distances, current_idx=idx)
                 reward = q_agent.compute_reward(
                     chosen_station, chosen_slots, station_prices_dict,
                     current_soc, car_data)
-                q_agent.update(state, chosen_station, reward, next_state)
+                q_agent.update(state, action, reward, next_state)
             else:
                 # ── Heuristic station selection (heuristic group) ────────────
                 chosen_station, chosen_slots = select_station_and_slots(

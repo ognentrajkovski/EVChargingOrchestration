@@ -4,28 +4,36 @@ Q-Learning Agent for EV Charging Station Selection
 Replaces the NetworkX graph-based station selection (fleet_graph.select_station_and_slots)
 with a Q-learning policy that learns which station to pick based on observed state.
 
+Works for any number of stations by operating on the TOP-3 NEAREST stations at
+decision time rather than a fixed, named set.  The agent never sees raw station
+IDs — it only sees positional slots (0 = closest, 1 = second-closest, 2 = third-
+closest) so the Q-table generalises across fleets of any size.
+
 State space (13-tuple):
   (soc_band,
-   price_A_level, occ_A_level, dist_A_band, trend_A,
-   price_B_level, occ_B_level, dist_B_band, trend_B,
-   price_C_level, occ_C_level, dist_C_band, trend_C)
+   price_0, occ_0, dist_0, trend_0,
+   price_1, occ_1, dist_1, trend_1,
+   price_2, occ_2, dist_2, trend_2)
 
-  soc_band          : 0=low(<30%), 1=mid(<50%), 2=high(>=50%)
-  price_X_level     : 0=off-peak, 1=normal, 2=peak  (relative to station base_price)
-  occ_X_level       : 0=free, 1=half-full, 2=full
-  dist_X_band       : 0=close(<3 km), 1=medium(<7 km), 2=far(>=7 km)
-                      — extracted from the NetworkX graph travel distances
-  trend_X           : 0=falling, 1=stable, 2=rising
-                      — compares reservation count at current slot vs next 2 slots;
-                        rising occupancy = rising price = book now before it gets worse
+  where 0/1/2 are the three nearest stations sorted by distance ascending.
+
+  soc_band      : 0=low(<30%), 1=mid(<50%), 2=high(>=50%)
+  price_N_level : 0=off-peak, 1=normal, 2=peak  (relative to station base_price)
+  occ_N_level   : 0=free, 1=half-full, 2=full
+  dist_N_band   : 0=close(<3 km), 1=medium(<7 km), 2=far(>=7 km)
+                  — extracted from the NetworkX graph travel distances
+  trend_N       : 0=falling, 1=stable, 2=rising
+                  — compares reservation count at current slot vs next 2 slots;
+                    rising occupancy = rising price = book now before it gets worse
 
 Total states: 3^13 = 1 594 323 — stored as a Python dict (only visited states allocated).
 
-Actions: ['station_A', 'station_B', 'station_C', None]
-  None means "don't book this tick" (used when all stations are too expensive).
+Actions: [0, 1, 2, None]
+  0/1/2  — index into the top-3 nearest stations list returned by get_top3_stations()
+  None   — "don't book this tick" (used when all stations are too expensive)
 
 The agent is instantiated once per Flink job in open() and lives in memory for
-the duration of the run. No persistence across restarts — that is intentional;
+the duration of the run.  No persistence across restarts — that is intentional;
 the learning curve visible on the dashboard is part of the comparison story.
 """
 
@@ -53,13 +61,21 @@ EPSILON_START = 0.80    # initial exploration probability
 EPSILON_MIN   = 0.10    # floor — never stop exploring entirely
 EPSILON_DECAY = 0.997   # multiplied after every Q-update
 
-ACTIONS = ['station_A', 'station_B', 'station_C', None]
+ACTIONS = [0, 1, 2, None]
+
+# Neutral pad values used when fewer than 3 stations are available:
+#   price_level=1 (normal), occ_level=1 (half-full), dist_band=1 (medium), trend=1 (stable)
+_PAD_SLOT = [1, 1, 1, 1]
 
 
 # ---------------------------------------------------------------------------
 class QLearningAgent:
     """
     Epsilon-greedy Q-learning agent for EV charging station selection.
+
+    Actions are positional indices (0, 1, 2) into the list returned by
+    get_top3_stations(), or None to skip the tick.  This makes the agent
+    independent of how many stations exist in the simulation.
 
     Public attributes (read by dashboard via RESERVATION_STATUS):
         epsilon        : float — current exploration rate
@@ -83,11 +99,30 @@ class QLearningAgent:
 
     # ── Public API ─────────────────────────────────────────────────────────
 
+    def get_top3_stations(self, station_distances: dict) -> list:
+        """
+        Return a list of up to 3 station IDs sorted by distance ascending.
+
+        Parameters
+        ----------
+        station_distances : {station_id: distance_km}
+            Distance from the car to every known station.
+
+        Returns
+        -------
+        list of up to 3 station ID strings (closest first).
+        """
+        STATIONS = _get_stations()
+        all_sids = list(STATIONS.keys())
+        sorted_sids = sorted(all_sids, key=lambda s: station_distances.get(s, 999.0))
+        return sorted_sids[:3]
+
     def encode_state(
         self,
         soc: float,
         station_prices: dict,
         station_res_counts: dict,
+        top3_stations: list,
         station_distances: dict = None,
         current_idx: int = 0,
     ) -> tuple:
@@ -99,7 +134,11 @@ class QLearningAgent:
         soc                : car's state of charge (0.0 – 1.0)
         station_prices     : {station_id: current_price_eur_mwh}
         station_res_counts : {station_id: {slot_idx: reservation_count}}
-        station_distances  : {station_id: distance_km}  — from NetworkX graph edges.
+        top3_stations      : list of up to 3 station IDs sorted by distance
+                             ascending — produced by get_top3_stations().
+                             If fewer than 3 entries, the missing slots are
+                             padded with neutral values [1, 1, 1, 1].
+        station_distances  : {station_id: distance_km}  — from NetworkX graph.
                              If None, all stations are treated as medium distance.
         current_idx        : current simulation slot index (0-95) — used to read
                              next 2 slots' reservation counts for the price trend.
@@ -107,41 +146,54 @@ class QLearningAgent:
         STATIONS = _get_stations()
         soc_band = 0 if soc < 0.30 else (1 if soc < 0.50 else 2)
         parts = [soc_band]
-        for sid in ['station_A', 'station_B', 'station_C']:
-            base  = STATIONS[sid]['base_price']
-            price = station_prices.get(sid, base)
-            price_level = (0 if price < base * 0.90
-                           else 1 if price < base * 1.30
-                           else 2)
-            cap    = STATIONS[sid]['capacity']
-            counts = station_res_counts.get(sid, {})
-            active = sum(counts.values())
-            occ_level = (0 if active == 0
-                         else 1 if active < cap * 0.6
-                         else 2)
-            # Distance band from NetworkX graph (0=close, 1=medium, 2=far)
-            dist_km   = (station_distances or {}).get(sid, 5.0)
-            dist_band = (0 if dist_km < 3.0 else 1 if dist_km < 7.0 else 2)
-            # Price trend: compare current slot occupancy vs avg of next 2 slots
-            # Rising occupancy → rising price → book now (trend=2)
-            # Falling occupancy → falling price → can wait (trend=0)
-            cur_cnt  = counts.get(current_idx, 0)
-            next_avg = (counts.get(current_idx + 1, 0)
-                        + counts.get(current_idx + 2, 0)) / 2.0
-            if next_avg > cur_cnt * 1.20:
-                trend = 2   # occupancy rising  → prices going up
-            elif next_avg < cur_cnt * 0.80:
-                trend = 0   # occupancy falling → prices going down
+
+        for i in range(3):
+            if i < len(top3_stations):
+                sid = top3_stations[i]
+                base  = STATIONS[sid]['base_price']
+                price = station_prices.get(sid, base)
+                price_level = (0 if price < base * 0.90
+                               else 1 if price < base * 1.30
+                               else 2)
+
+                cap    = STATIONS[sid]['capacity']
+                counts = station_res_counts.get(sid, {})
+                active = sum(counts.values())
+                occ_level = (0 if active == 0
+                             else 1 if active < cap * 0.6
+                             else 2)
+
+                # Distance band from NetworkX graph (0=close, 1=medium, 2=far)
+                dist_km   = (station_distances or {}).get(sid, 5.0)
+                dist_band = (0 if dist_km < 3.0 else 1 if dist_km < 7.0 else 2)
+
+                # Price trend: compare current slot occupancy vs avg of next 2 slots
+                # Rising occupancy → rising price → book now (trend=2)
+                # Falling occupancy → falling price → can wait (trend=0)
+                cur_cnt  = counts.get(current_idx, 0)
+                next_avg = (counts.get(current_idx + 1, 0)
+                            + counts.get(current_idx + 2, 0)) / 2.0
+                if next_avg > cur_cnt * 1.20:
+                    trend = 2   # occupancy rising  → prices going up
+                elif next_avg < cur_cnt * 0.80:
+                    trend = 0   # occupancy falling → prices going down
+                else:
+                    trend = 1   # stable
+
+                parts.extend([price_level, occ_level, dist_band, trend])
             else:
-                trend = 1   # stable
-            parts.extend([price_level, occ_level, dist_band, trend])
+                # Fewer than 3 stations available — pad with neutral values
+                parts.extend(_PAD_SLOT)
+
         return tuple(parts)
 
     def select_action(self, state: tuple):
         """
         Epsilon-greedy action selection.
 
-        Returns one of ACTIONS (station_id string or None).
+        Returns one of ACTIONS: 0, 1, 2, or None.
+          0/1/2 are indices into the top-3 nearest stations list.
+          None means skip this tick.
         """
         if random.random() < self.epsilon:
             return random.choice(ACTIONS)
@@ -158,6 +210,10 @@ class QLearningAgent:
         """
         Standard Q-update:
             Q[s,a] ← Q[s,a] + α · (r + γ · max_a' Q[s',a'] − Q[s,a])
+
+        Parameters
+        ----------
+        action : 0, 1, 2, or None  (index into ACTIONS list)
 
         Decays epsilon and records reward for the dashboard sparkline.
         """
@@ -183,6 +239,12 @@ class QLearningAgent:
     ) -> float:
         """
         Immediate reward for a booking decision.
+
+        Parameters
+        ----------
+        chosen_station : station ID string (already resolved from the action index
+                         by the caller) or None if the agent chose to skip.
+        chosen_slots   : list of booked slot indices.
 
         Reward components:
           • Base:     (2.0 - price/base_price) × num_slots  → cheaper = higher
