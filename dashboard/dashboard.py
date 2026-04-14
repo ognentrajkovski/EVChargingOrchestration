@@ -316,6 +316,7 @@ defaults = {
     'q_agent_epsilon':         1.0,
     'q_agent_steps':           0,
     'q_agent_rewards':         [],
+    'q_agent_per_car':         {},   # car_id → {epsilon, steps, last_reward, avg_reward}
     # ── Per-group cumulative metrics (from RESERVATION_STATUS group_metrics) ─
     'gm_heuristic': {'charge_count': 0, 'emergency_count': 0,
                      'total_cost_eur': 0.0, 'soc_sum': 0.0, 'car_count': 0},
@@ -509,6 +510,9 @@ def poll_kafka():
                                 if len(st.session_state['q_agent_rewards']) > 200:
                                     st.session_state['q_agent_rewards'] = \
                                         st.session_state['q_agent_rewards'][-200:]
+                            per_car = q_stats.get('per_car', {})
+                            if per_car:
+                                st.session_state['q_agent_per_car'].update(per_car)
                         # Per-group metrics (accumulate each tick)
                         for grp_key, grp_data in (data.get('group_metrics') or {}).items():
                             ss_key = f'gm_{grp_key}'
@@ -1542,6 +1546,29 @@ elif _view == "AI Agent":
             st.line_chart(_rewards, height=110, use_container_width=True)
         else:
             st.caption("Waiting for AI agent data…")
+    # Per-car Q-agent stats table
+    _per_car_data = st.session_state.get('q_agent_per_car', {})
+    if _per_car_data:
+        st.markdown('<div class="section-hdr">Per-Car Q-Agent Stats</div>', unsafe_allow_html=True)
+        _pc_rows = []
+        for _cid, _cstats in sorted(_per_car_data.items()):
+            _pc_rows.append({
+                'Car ID':            _cid,
+                'ε (explore)':       _cstats.get('epsilon', 1.0),
+                'Steps':             _cstats.get('steps', 0),
+                'Last reward':       round(_cstats.get('last_reward', 0.0), 3),
+                'Avg reward (×20)':  round(_cstats.get('avg_reward', 0.0), 3),
+            })
+        _pc_df = pd.DataFrame(_pc_rows).set_index('Car ID')
+        st.dataframe(
+            _pc_df.style
+                .background_gradient(subset=['ε (explore)'], cmap='RdYlGn_r', vmin=0.10, vmax=0.80)
+                .background_gradient(subset=['Avg reward (×20)'], cmap='RdYlGn', vmin=-5.0, vmax=5.0)
+                .format({'ε (explore)': '{:.3f}', 'Steps': '{:,}',
+                         'Last reward': '{:+.3f}', 'Avg reward (×20)': '{:+.3f}'}),
+            use_container_width=True,
+            height=min(40 + 35 * len(_pc_rows), 500),
+        )
     st.markdown('<div class="section-hdr">Performance Metrics</div>', unsafe_allow_html=True)
     st.caption("Strategy: ε-greedy Q-learning — learns which station gives best reward (cheap + near + available)")
     _render_group_metrics(_gm_a, _a_sc)
@@ -1550,6 +1577,7 @@ elif _view == "AI Agent":
                                                      'total_cost_eur': 0.0, 'soc_sum': 0.0, 'car_count': 0}
         st.session_state['gm_a_station_counts'] = {}
         st.session_state['q_agent_rewards']     = []
+        st.session_state['q_agent_per_car']     = {}
     _render_main_dashboard('ai', 'a_car_')
 
 # ── Comparison view ───────────────────────────────────────────────────────────

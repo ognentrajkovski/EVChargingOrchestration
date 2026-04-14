@@ -528,6 +528,8 @@ The system runs two groups of 40 cars simultaneously in the **same Flink job**, 
 
 Both groups share the same reservation board, the same physical chargers, and the same dynamic prices. Phase 2 execution (charger allocation, capacity enforcement) is identical for both groups.
 
+**Per-car agents:** Each AI car has its own independent `QLearningAgent` instance (`self._q_agents[car_id]`). Cars do not share Q-tables — each agent learns from its own experience (different starting position, different SOC history, different routes). This allows each car to develop a personalised routing policy based on its own location relative to the stations.
+
 **Per-group metrics** are emitted every tick in `RESERVATION_STATUS.group_metrics`:
 - `charge_count`, `emergency_count`, `avg_cost_eur`, `avg_soc`, `car_count`
 
@@ -686,7 +688,7 @@ The dashboard uses `st.radio(horizontal=True)` navigation (not `st.tabs`) so onl
 | View | Contents |
 |---|---|
 | **Heuristic** | Full dashboard filtered to `h_car_*` group only |
-| **AI Agent** | Full dashboard filtered to `a_car_*` group + Q-agent epsilon/reward sparkline |
+| **AI Agent** | Full dashboard filtered to `a_car_*` group + Q-agent epsilon/reward sparkline + per-car Q-agent stats table |
 | **Comparison** | Metrics table + bar chart comparing both groups — no charts, no panels |
 
 #### Panels (Heuristic and AI Agent views)
@@ -704,6 +706,7 @@ The dashboard uses `st.radio(horizontal=True)` navigation (not `st.tabs`) so onl
 | Routing Decision Matrix | Right | Per-car: Travel€ + Charge€ = Total€ for all 3 stations; ✓ marks the current cheapest option using occupancy-projected prices (matches Flink logic) |
 | Charging Stations | Right | Live charger slots per station — which car is currently plugged in |
 | Fleet Status | Right | Compact car cards: SOC bar, kWh, priority, station badge; badges include `CHARGING`, `TRANSIT`, `EMERGENCY`, `DEFERRED_PRICE`, `DEFERRED_FULL`, `IDLE` |
+| **Per-Car Q-Agent Stats** *(AI Agent view only)* | Full width | Table with one row per AI car showing: exploration ε, total Q-updates, last reward, and rolling average reward (last 20 updates). Colour-coded: ε column red→green (low ε = learned), avg reward column red→green (positive = good). Resets with the "Reset AI metrics" button. |
 
 ---
 

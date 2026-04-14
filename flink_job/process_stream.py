@@ -98,8 +98,8 @@ class EVFleetProcessor(KeyedProcessFunction):
         self.was_charging = runtime_context.get_map_state(
             MapStateDescriptor("was_charging", Types.STRING(), Types.BOOLEAN()))
 
-        # --- Q-learning agent (always active — handles ai group cars) ---
-        self._q_agent = QLearningAgent()
+        # --- Per-car Q-learning agents (one per AI car, created on first decision) ---
+        self._q_agents: dict = {}  # car_id → QLearningAgent
 
         # --- Reservation board ---
         # key: "{station_id}:{slot_idx}"  →  value: JSON list of car_ids
@@ -319,7 +319,12 @@ class EVFleetProcessor(KeyedProcessFunction):
                     if chosen_station else []
                 )
             elif car_data.get('group') == 'ai':
-                # ── Q-Learning station selection (ai group) ──────────────────
+                # ── Per-car Q-Learning station selection (ai group) ──────────
+                # Each AI car has its own agent — created on first decision.
+                if car_id not in self._q_agents:
+                    self._q_agents[car_id] = QLearningAgent()
+                q_agent = self._q_agents[car_id]
+
                 station_prices_dict = {
                     sid: (self.station_prices.get(sid) or STATIONS[sid]['base_price'])
                     for sid in STATIONS
@@ -330,10 +335,10 @@ class EVFleetProcessor(KeyedProcessFunction):
                     edge = G.get_edge_data(car_id, sid)
                     station_distances[sid] = edge['distance_km'] if edge else 5.0
 
-                state          = self._q_agent.encode_state(
+                state          = q_agent.encode_state(
                     current_soc, station_prices_dict, station_res_counts,
                     station_distances, current_idx=idx)
-                chosen_station = self._q_agent.select_action(state)
+                chosen_station = q_agent.select_action(state)
                 chosen_slots   = (
                     self._select_cheapest_slots_at_station(
                         chosen_station, idx, num_needed, station_res_counts)
@@ -341,13 +346,13 @@ class EVFleetProcessor(KeyedProcessFunction):
                 )
                 # Q-update: observe next state after booking
                 next_res_counts = self._load_station_reservation_counts()
-                next_state      = self._q_agent.encode_state(
+                next_state      = q_agent.encode_state(
                     current_soc, station_prices_dict, next_res_counts,
                     station_distances, current_idx=idx)
-                reward = self._q_agent.compute_reward(
+                reward = q_agent.compute_reward(
                     chosen_station, chosen_slots, station_prices_dict,
                     current_soc, car_data)
-                self._q_agent.update(state, chosen_station, reward, next_state)
+                q_agent.update(state, chosen_station, reward, next_state)
             else:
                 # ── Heuristic station selection (heuristic group) ────────────
                 chosen_station, chosen_slots = select_station_and_slots(
@@ -668,9 +673,27 @@ class EVFleetProcessor(KeyedProcessFunction):
                 for grp, m in group_metrics.items()
             },
             'q_agent_stats': {
-                'epsilon':        round(self._q_agent.epsilon, 3),
-                'steps':          self._q_agent.steps,
-                'reward_history': self._q_agent.reward_history[-50:],
+                'epsilon': round(
+                    sum(a.epsilon for a in self._q_agents.values()) / len(self._q_agents)
+                    if self._q_agents else 0.80, 3),
+                'steps': sum(a.steps for a in self._q_agents.values()),
+                'reward_history': sorted(
+                    [r for a in self._q_agents.values()
+                       for r in a.reward_history[-5:]],
+                )[-50:],
+                'agent_count': len(self._q_agents),
+                'per_car': {
+                    car_id: {
+                        'epsilon':     round(agent.epsilon, 3),
+                        'steps':       agent.steps,
+                        'last_reward': agent.reward_history[-1]
+                                       if agent.reward_history else 0.0,
+                        'avg_reward':  round(
+                            sum(agent.reward_history[-20:]) / len(agent.reward_history[-20:]), 3)
+                                       if agent.reward_history else 0.0,
+                    }
+                    for car_id, agent in self._q_agents.items()
+                },
             },
         }
         yield json.dumps(reservation_status)
