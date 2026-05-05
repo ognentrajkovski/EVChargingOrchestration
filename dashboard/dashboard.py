@@ -6,6 +6,7 @@ import uuid
 import math
 
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
@@ -255,13 +256,40 @@ html, body, [class*="css"] {
 }
 
 /* Suppress the dim/fade overlay Streamlit applies during reruns */
-[data-testid="stAppViewContainer"],
-[data-testid="stAppViewContainer"] > .main,
-[data-testid="stAppViewContainer"] > .main > .block-container,
-.stApp { opacity: 1 !important; transition: none !important; }
 [data-testid="stStatusWidget"] { display: none !important; }
 </style>
 """, unsafe_allow_html=True)
+
+# Inject a MutationObserver into the parent page that immediately reverts any
+# sub-1 opacity Streamlit's React layer writes onto DOM elements during reruns.
+# CSS !important alone cannot beat React's inline style writes in all versions,
+# so we intercept them at the JS level via the component iframe's access to
+# window.parent.document.
+components.html("""
+<script>
+(function() {
+    try {
+        var doc = window.parent.document;
+        // Disconnect any observer left by a previous render of this iframe.
+        if (window.__noFlashObs) window.__noFlashObs.disconnect();
+        window.__noFlashObs = new MutationObserver(function(mutations) {
+            for (var i = 0; i < mutations.length; i++) {
+                var el = mutations[i].target;
+                if (el.style && parseFloat(el.style.opacity) < 1) {
+                    el.style.opacity = '1';
+                    el.style.transition = 'none';
+                }
+            }
+        });
+        window.__noFlashObs.observe(doc.body, {
+            attributes: true,
+            attributeFilter: ['style'],
+            subtree: true
+        });
+    } catch(e) {}
+})();
+</script>
+""", height=0)
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 BOOTSTRAP_SERVERS    = os.environ.get('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092')
