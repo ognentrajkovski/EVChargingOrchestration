@@ -253,6 +253,13 @@ html, body, [class*="css"] {
     text-transform: uppercase;
     letter-spacing: 0.1em;
 }
+
+/* Suppress the dim/fade overlay Streamlit applies during reruns */
+[data-testid="stAppViewContainer"],
+[data-testid="stAppViewContainer"] > .main,
+[data-testid="stAppViewContainer"] > .main > .block-container,
+.stApp { opacity: 1 !important; transition: none !important; }
+[data-testid="stStatusWidget"] { display: none !important; }
 </style>
 """, unsafe_allow_html=True)
 
