@@ -40,13 +40,19 @@ _SOC_BANDS = [
 ]
 
 
-def acceptable_price(soc: float, is_charging: bool = False) -> float:
+def acceptable_price(soc: float, is_charging: bool = False,
+                     reference_price: float = BASE_PRICE) -> float:
     """
     Return the maximum price (EUR/MWh) this car is willing to pay at the
     given state-of-charge.  Below EMERGENCY_SOC_THRESHOLD the car will charge
     regardless, so this value is only consulted for non-emergency decisions.
-    
-    Hysteresis is applied if the car is already charging to prevent rapid 
+
+    reference_price should be the station's base_price (its normal-occupancy
+    price), not the global BASE_PRICE constant.  Scaling thresholds against
+    the actual station baseline means a car at an expensive station (72 €/MWh)
+    is compared fairly against that station's peak, not against a hardcoded 50.
+
+    Hysteresis is applied if the car is already charging to prevent rapid
     plug/unplug ping-ponging when its own charging triggers a price spike.
     """
     base_multiplier = 0.50
@@ -54,24 +60,27 @@ def acceptable_price(soc: float, is_charging: bool = False) -> float:
         if soc < upper:
             base_multiplier = multiplier
             break
-            
-    # Hysteresis bonus: if we already hold a slot, we are willing to pay 
+
+    # Hysteresis bonus: if we already hold a slot, we are willing to pay
     # +0.6x base price more to keep it, so we don't bounce out instantly
     if is_charging:
         base_multiplier += 0.60
-        
-    return BASE_PRICE * base_multiplier
+
+    return reference_price * base_multiplier
 
 
-def decide_charge(car: dict, current_price: float, is_charging: bool = False) -> bool:
+def decide_charge(car: dict, current_price: float, is_charging: bool = False,
+                  reference_price: float = BASE_PRICE) -> bool:
     """
     Real-time bidding decision for a single car.
 
     Parameters
     ----------
-    car           : car state dict, must contain 'current_soc' (0.0 – 1.0)
-    current_price : current dynamic charging price in EUR/MWh
-    is_charging   : whether the car is already actively charging this tick
+    car             : car state dict, must contain 'current_soc' (0.0 – 1.0)
+    current_price   : current dynamic charging price in EUR/MWh
+    is_charging     : whether the car is already actively charging this tick
+    reference_price : the station's base_price used to scale SOC-band thresholds;
+                      defaults to BASE_PRICE for backward compatibility
 
     Returns
     -------
@@ -89,5 +98,5 @@ def decide_charge(car: dict, current_price: float, is_charging: bool = False) ->
         return True  # charge at any price
 
     # --- Price-sensitive decision ---
-    threshold = acceptable_price(soc, is_charging)
+    threshold = acceptable_price(soc, is_charging, reference_price)
     return current_price <= threshold

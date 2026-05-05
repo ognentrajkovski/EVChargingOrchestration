@@ -479,12 +479,28 @@ class EVFleetProcessor(KeyedProcessFunction):
                 continue
             current_soc  = car_data.get('current_soc', 1.0)
             prev_charging = self.was_charging.get(car_id) or False
-            # Use the car's planned station price as proxy; fallback to station_A
+
+            # Evaluate willingness against the cheapest currently-free station so
+            # a car isn't blocked by its planned station's peak price when a
+            # cheaper option exists.  The threshold scales with that station's
+            # base_price so the SOC-band multipliers (1.8×, 2.5×) remain
+            # meaningful relative to that station's normal rate.
             res_json = self.car_reservations.get(car_id)
             car_res  = json.loads(res_json) if res_json else None
             planned_sid = car_res.get('station_id') if car_res else 'station_A'
-            proxy_price = (self.station_prices.get(planned_sid)
-                           or STATIONS.get(planned_sid, {}).get('base_price', BASE_PRICE))
+
+            free_station_prices = sorted(
+                (self.station_prices.get(sid) or STATIONS[sid]['base_price'], sid)
+                for sid in STATIONS
+                if station_busy[sid] < STATIONS[sid]['capacity']
+            )
+            if free_station_prices:
+                proxy_price = free_station_prices[0][0]
+                ref_price   = STATIONS[free_station_prices[0][1]]['base_price']
+            else:
+                proxy_price = (self.station_prices.get(planned_sid)
+                               or STATIONS.get(planned_sid, {}).get('base_price', BASE_PRICE))
+                ref_price   = BASE_PRICE
 
             if current_soc >= 0.99:
                 charge_decisions[car_id] = (False, "full", car_data, None)
@@ -507,7 +523,7 @@ class EVFleetProcessor(KeyedProcessFunction):
                     log('FLINK', f'{car_id} | ARRIVED → {planned_sid} | soc={current_soc*100:.1f}%')
                     continue
 
-            car_wants_to_charge = decide_charge(car_data, proxy_price, prev_charging)
+            car_wants_to_charge = decide_charge(car_data, proxy_price, prev_charging, ref_price)
 
             if car_wants_to_charge:
                 # Pick nearest station with free capacity
