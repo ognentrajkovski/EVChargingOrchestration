@@ -298,6 +298,38 @@ def get_reservation_summary(G: nx.DiGraph) -> Dict[str, Dict[int, int]]:
 
 
 # ---------------------------------------------------------------------------
+# In-place slot update — avoids full graph rebuild per car in Phase 1
+# ---------------------------------------------------------------------------
+
+def update_slot_reservation(
+    G: nx.DiGraph,
+    station_id: str,
+    slots: List[int],
+    delta: int,
+) -> None:
+    """
+    Update slot node attributes in-place after a booking (delta=+1) or
+    cancellation (delta=-1).  Keeps the graph accurate across the Phase 1
+    loop without rebuilding all nodes and edges from scratch each time.
+    """
+    stn        = STATIONS[station_id]
+    capacity   = stn["capacity"]
+    base_price = stn["base_price"]
+    for slot_idx in slots:
+        node_id = f"{station_id}:slot:{slot_idx}"
+        if not G.has_node(node_id):
+            continue
+        node      = G.nodes[node_id]
+        new_count = max(0, node["reservation_count"] + delta)
+        new_price = _projected_price(new_count, capacity, base_price)
+        node["reservation_count"] = new_count
+        node["projected_price"]   = new_price
+        node["is_full"]           = new_count >= capacity
+        if G.has_edge(station_id, node_id):
+            G[station_id][node_id]["weight"] = new_price
+
+
+# ---------------------------------------------------------------------------
 # Academic / debug utilities
 # ---------------------------------------------------------------------------
 

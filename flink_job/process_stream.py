@@ -46,6 +46,7 @@ from heuristic_scheduler import decide_charge, BASE_PRICE, MAX_POWER_PER_CHARGER
 from reservation_scheduler import should_replan, slots_needed, SLOTS_PER_DAY
 from fleet_graph import (
     build_fleet_graph,
+    update_slot_reservation,
     select_station_and_slots,
     nearest_available_station,
     get_cars_reserved_at_slot,
@@ -284,7 +285,13 @@ class EVFleetProcessor(KeyedProcessFunction):
 
         # ===================================================================
         # PHASE 1 — PLANNING
+        # Build graph once; patch slot nodes in-place after each booking
+        # so subsequent cars see accurate reservation counts without a
+        # full rebuild.  Reduces Phase 1 from O(N²) to O(N).
         # ===================================================================
+        station_res_counts = self._load_station_reservation_counts()
+        G = build_fleet_graph(cars_dict, station_res_counts, idx)
+
         for car_id, car_data in car_list:
             current_soc  = car_data.get('current_soc', 1.0)
             is_emergency = current_soc < 0.15
@@ -295,21 +302,23 @@ class EVFleetProcessor(KeyedProcessFunction):
             if not should_replan(car_res, idx, current_soc):
                 continue
 
-            # Remove from old station's board
+            # Remove from old station's board and update in-memory state
             if car_res and car_res.get('reserved_slots') and car_res.get('station_id'):
-                self._remove_car_from_board(
-                    car_id, car_res['station_id'], car_res['reserved_slots'])
+                old_sid   = car_res['station_id']
+                old_slots = car_res['reserved_slots']
+                self._remove_car_from_board(car_id, old_sid, old_slots)
+                old_counts = station_res_counts.get(old_sid, {})
+                for slot in old_slots:
+                    if old_counts.get(slot, 0) > 0:
+                        old_counts[slot] -= 1
+                        if old_counts[slot] == 0:
+                            del old_counts[slot]
+                update_slot_reservation(G, old_sid, old_slots, -1)
 
             num_needed = slots_needed(current_soc)
             if num_needed <= 0:
                 self.car_reservations.remove(car_id)
                 continue
-
-            # Rebuild graph so this car sees all previous replans this tick
-            station_res_counts  = self._load_station_reservation_counts()
-            car_res_snapshot    = self._load_all_car_reservations()
-            G = build_fleet_graph(
-                cars_dict, station_res_counts, idx, car_reservations=car_res_snapshot)
 
             if is_emergency:
                 chosen_station = nearest_available_station(G, car_id, idx)
@@ -350,9 +359,9 @@ class EVFleetProcessor(KeyedProcessFunction):
                     if chosen_station else []
                 )
                 # Q-update: observe next state after booking
-                next_res_counts = self._load_station_reservation_counts()
+                # station_res_counts is already up-to-date (patched in-place above)
                 next_state      = q_agent.encode_state(
-                    current_soc, station_prices_dict, next_res_counts,
+                    current_soc, station_prices_dict, station_res_counts,
                     top3_stations, station_distances, current_idx=idx)
                 reward = q_agent.compute_reward(
                     chosen_station, chosen_slots, station_prices_dict,
@@ -368,6 +377,10 @@ class EVFleetProcessor(KeyedProcessFunction):
                 continue
 
             self._add_car_to_board(car_id, chosen_station, chosen_slots)
+            new_counts = station_res_counts.setdefault(chosen_station, {})
+            for slot in chosen_slots:
+                new_counts[slot] = new_counts.get(slot, 0) + 1
+            update_slot_reservation(G, chosen_station, chosen_slots, +1)
             new_res = {
                 'station_id':     chosen_station,
                 'reserved_slots': chosen_slots,
@@ -393,10 +406,10 @@ class EVFleetProcessor(KeyedProcessFunction):
 
         # ===================================================================
         # PHASE 2 — EXECUTION
-        # Build the graph once after all replanning is done
+        # station_res_counts is already up-to-date from Phase 1.
+        # Rebuild G once with RESERVED edges added for charger assignment.
         # ===================================================================
-        station_res_counts = self._load_station_reservation_counts()
-        car_res_snapshot   = self._load_all_car_reservations()
+        car_res_snapshot = self._load_all_car_reservations()
         G = build_fleet_graph(
             cars_dict, station_res_counts, idx, car_reservations=car_res_snapshot)
 
